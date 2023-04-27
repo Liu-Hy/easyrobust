@@ -43,8 +43,9 @@ from timm.utils import ApexScaler, NativeScaler
 from timm.data import create_transform
 from timm.data.distributed_sampler import OrderedDistributedSampler
 
+from utils import encoder_forward, encoder_level_epsilon_noise
 from ImageNetDG import ImageNetDG
-from easyrobust.third_party.vqgan import VQModel, reconstruct_with_vqgan
+from vqgan import VQModel, reconstruct_with_vqgan
 from easyrobust.attacks import pgd_generator
 
 from ffrecord.torch import DataLoader
@@ -72,6 +73,8 @@ except ImportError:
     has_wandb = False
 
 torch.backends.cudnn.benchmark = True
+_logger = logging.getLogger('train')
+setup_default_logging()
 
 def normalize_fn(tensor, mean, std):
     """Differentiable version of torchvision.functional.normalize"""
@@ -114,8 +117,8 @@ def _parse_args():
 
 
 def main(local_rank, args, args_text):
-    _logger = logging.getLogger('train')
-    setup_default_logging()
+    #_logger = logging.getLogger('train')
+    # setup_default_logging()
     if args.log_wandb:
         if has_wandb:
             wandb.init(project=args.experiment, config=args)
@@ -123,6 +126,7 @@ def main(local_rank, args, args_text):
             _logger.warning("You've requested to log metrics to wandb but package not found. "
                             "Metrics not being logged to wandb, try `pip install wandb`")
 
+    rounds = 3
     lim = args.lim
     nlr = args.nlr
     eps = args.eps
@@ -132,7 +136,7 @@ def main(local_rank, args, args_text):
     val_ratio = 1.
 
     if args.debug:
-        train_batch_size, val_batch_size = 2, 2
+        args.batch_size = 2
         img_ratio, train_ratio, val_ratio = 0.001, 0.001, 0.1
 
     args.distributed = False
@@ -411,6 +415,16 @@ def main(local_rank, args, args_text):
         persistent_workers=False
     )
 
+    loader_img = torch.utils.data.DataLoader(
+        dataset_train,
+        shuffle=train_sampler is None,
+        batch_size=args.batch_size,
+        num_workers=args.workers,
+        pin_memory=args.pin_mem,
+        drop_last=True,
+        persistent_workers=False
+    )
+
     # setup loss function
     if args.jsd_loss:
         assert num_aug_splits > 1  # JSD only valid with aug splits set
@@ -486,8 +500,18 @@ def main(local_rank, args, args_text):
                         model_ema.module, loader_eval, validate_loss_fn, args, val_ratio, amp_autocast=amp_autocast,
                         log_suffix=' (EMA)')
                     if args.rank == 0:
-                        best_metric = ema_eval_metrics
+                        best_metric = ema_eval_metrics[eval_metric]
                         print(f'Original Acc: {best_metric:.2f}%')
+
+            if delta_x is None:
+                if local_rank == 0:
+                    print("---- Learning noise")
+                img_size = model.module[1].patch_embed.img_size[0]
+                delta_x = encoder_level_epsilon_noise(model, loader_img, img_size, rounds, nlr, lim, eps, img_ratio,
+                                                      disable=True)
+                torch.save({"delta_x": delta_x}, noise_path.joinpath(str(epoch)))
+            if local_rank == 0:
+                print(f"Noise norm: {round(torch.norm(delta_x).item(), 4)}")
 
             train_metrics = train_one_epoch(
                 epoch, model, loader_train, optimizer, train_loss_fn, args, best_metric, start_step, adv, delta_x, train_ratio,
@@ -593,9 +617,9 @@ def train_one_epoch(
             loss += loss_fn(output2, target)
 
         if adv:
-            x = model.module.patch_embed(input)
+            x = model.module[1].patch_embed(input)
             x = x + delta_x.cuda(non_blocking=True)
-            adv_outputs = model.module.head(encoder_forward(model, x))
+            adv_outputs = model.module[1].head(encoder_forward(model, x))
             adv_loss = loss_fn(adv_outputs, target)
             # adv_loss.backward()
             consistency = ((adv_outputs - output) ** 2).sum(dim=-1).mean()

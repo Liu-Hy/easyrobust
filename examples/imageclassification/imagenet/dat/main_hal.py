@@ -36,8 +36,9 @@ from timm.scheduler import create_scheduler
 from timm.utils import ApexScaler, NativeScaler
 from timm.data import create_transform
 
+from utils import encoder_forward, encoder_level_epsilon_noise
 from ImageNetDG_10 import ImageNetDG_10
-from easyrobust.third_party.vqgan import VQModel, reconstruct_with_vqgan
+from vqgan import VQModel, reconstruct_with_vqgan
 from easyrobust.attacks import pgd_generator
 import easyrobust.models
 
@@ -363,6 +364,7 @@ def main():
             _logger.warning("You've requested to log metrics to wandb but package not found. "
                             "Metrics not being logged to wandb, try `pip install wandb`")
 
+    rounds = 3
     lim = args.lim
     nlr = args.nlr
     eps = args.eps
@@ -372,8 +374,8 @@ def main():
     val_ratio = 1.
 
     if args.debug:
-        train_batch_size, val_batch_size = 2, 2
-        img_ratio, train_ratio, val_ratio = 0.001, 0.001, 0.1
+        args.batch_size = 2
+        img_ratio, train_ratio, val_ratio = 0.0001, 0.0001, 0.001
 
 
     # resolve AMP arguments based on PyTorch / Apex availability
@@ -392,7 +394,8 @@ def main():
         _logger.warning("Neither APEX or native Torch AMP is available, using float32. "
                         "Install NVIDA apex or upgrade to PyTorch 1.6")
 
-    random_seed(args.seed, args.rank)
+    random_seed(args.seed, 0)
+    args.world_size = 1
 
     model = create_model(
         args.model,
@@ -477,7 +480,7 @@ def main():
         model_ema = ModelEmaV2(
             model, decay=args.model_ema_decay, device='cpu' if args.model_ema_force_cpu else None)
         if args.resume:
-            load_checkpoint(model_ema.module, args.resume, use_ema=True)
+            load_checkpoint(model_ema.module.module, args.resume, use_ema=True)
 
     # setup learning rate schedule and starting epoch
     lr_scheduler, num_epochs = create_scheduler(args, optimizer)
@@ -593,6 +596,15 @@ def main():
         persistent_workers=True
     )
 
+    loader_img = torch.utils.data.DataLoader(
+        dataset_train,
+        shuffle=train_sampler is None,
+        batch_size=args.batch_size,
+        num_workers=args.workers,
+        pin_memory=args.pin_mem,
+        drop_last=True,
+        persistent_workers=True
+    )
     # setup loss function
     if args.jsd_loss:
         assert num_aug_splits > 1  # JSD only valid with aug splits set
@@ -655,7 +667,8 @@ def main():
                 delta_x = torch.load(noise_path.joinpath(str(epoch)))['delta_x']
             else:
                 print("---- Learning noise")
-                delta_x = encoder_level_epsilon_noise(model, img_loader, img_size, rounds, nlr, lim, eps, img_ratio)
+                img_size = model.module[1].patch_embed.img_size[0]
+                delta_x = encoder_level_epsilon_noise(model, loader_img, img_size, rounds, nlr, lim, eps, img_ratio)
                 torch.save({"delta_x": delta_x}, noise_path.joinpath(str(epoch)))
 
 
@@ -681,11 +694,10 @@ def main():
                     epoch, train_metrics, eval_metrics, os.path.join(output_dir, 'summary.csv'),
                     write_header=best_metric is None, log_wandb=args.log_wandb and has_wandb)
 
-            torch.save({"model_name": model_name, "epoch": epoch,
+            torch.save({"model_name": safe_model_name(args.model), "epoch": epoch,
                         "model_state_dict": model.module.state_dict(),
                         "state_dict_ema": model_ema.module.module.state_dict(),
                         "optimizer_state_dict": optimizer.state_dict(),
-                        "scheduler_state_dict": scheduler.state_dict(),
                         "result": eval_metrics[eval_metric]}, model_path.joinpath(str(epoch)))
 
             if best_metric is None or eval_metrics[eval_metric] > best_metric:
@@ -762,9 +774,9 @@ def train_one_epoch(
             loss += loss_fn(output2, target)
 
         if adv:
-            x = model.module.patch_embed(input)
+            x = model.module[1].patch_embed(input)
             x = x + delta_x.cuda(non_blocking=True)
-            adv_outputs = model.module.head(encoder_forward(model, x))
+            adv_outputs = model.module[1].head(encoder_forward(model, x))
             adv_loss = loss_fn(adv_outputs, target)
             # adv_loss.backward()
             consistency = ((adv_outputs - output) ** 2).sum(dim=-1).mean()
