@@ -19,11 +19,12 @@ import logging
 from collections import OrderedDict
 from contextlib import suppress
 from datetime import datetime
+from pathlib import Path
+import torchattacks
 
 import torch
 import torch.nn as nn
 import torchvision.utils
-from torch.nn.parallel import DistributedDataParallel as NativeDDP
 
 from timm.data import resolve_data_config, Mixup
 from timm.models import create_model, safe_model_name, resume_checkpoint, load_checkpoint, \
@@ -34,16 +35,14 @@ from timm.optim import create_optimizer_v2, optimizer_kwargs
 from timm.scheduler import create_scheduler
 from timm.utils import ApexScaler, NativeScaler
 from timm.data import create_transform
-from timm.data.distributed_sampler import OrderedDistributedSampler
 
-from easyrobust.datasets import ImageNetDataset
+from ImageNetDG_10 import ImageNetDG_10
 from easyrobust.third_party.vqgan import VQModel, reconstruct_with_vqgan
 from easyrobust.attacks import pgd_generator
 import easyrobust.models
 
 try:
     from apex import amp
-    from apex.parallel import DistributedDataParallel as ApexDDP
     from apex.parallel import convert_syncbn_model
 
     has_apex = True
@@ -75,9 +74,18 @@ parser.add_argument('-c', '--config', default='', type=str, metavar='FILE',
 
 parser = argparse.ArgumentParser(description='PyTorch ImageNet Training')
 
+# Related to nullspace
+parser.add_argument('-db', '--debug', action='store_true')
+parser.add_argument('--lim', type=float, default=3, help='sampling limit of the noise')
+parser.add_argument('--nlr', type=float, default=0.1, help='learning rate for the noise')
+parser.add_argument('--eps', type=float, default=0.01, help='threshold to stop training the noise')
+parser.add_argument('--no-adv', action='store_true')
+
 # Dataset / Model parameters
-parser.add_argument('--data_dir', metavar='DIR', default='',
+parser.add_argument('--data_dir', metavar='DIR', default='../../../../../data',
                     help='path to dataset')
+parser.add_argument('--info-path', default='./info',
+                    help='path to ImageNet label info')
 parser.add_argument('--train-split', metavar='NAME', default='train',
                     help='dataset train split (default: train)')
 parser.add_argument('--val-split', metavar='NAME', default='validation',
@@ -86,15 +94,16 @@ parser.add_argument('--dataset-download', action='store_true', default=False,
                     help='Allow download of dataset for torch/ and tfds/ datasets that support it.')
 parser.add_argument('--class-map', default='', type=str, metavar='FILENAME',
                     help='path to class to idx mapping file (default: "")')
-parser.add_argument('--model', default='resnet50', type=str, metavar='MODEL',
+parser.add_argument('--model', default='vit_base_patch16_224', type=str, metavar='MODEL',
                     help='Name of model to train (default: "resnet50"')
 parser.add_argument('--pretrained', action='store_true', default=False,
                     help='Start with pretrained version of specified network (if avail)')
 parser.add_argument('--initial-checkpoint', default='', type=str, metavar='PATH',
                     help='Initialize model from this checkpoint (default: none)')
-parser.add_argument('--resume', default='', type=str, metavar='PATH',
+parser.add_argument('--resume', default='../../../../pretrained/vit_base_patch16_224-dat.pth.tar', type=str,
+                    metavar='PATH',
                     help='Resume full model and optimizer state from checkpoint (default: none)')
-parser.add_argument('--no-resume-opt', action='store_true', default=False,
+parser.add_argument('--resume-opt', action='store_true', default=False,
                     help='prevent resume of optimizer state when resuming model')
 parser.add_argument('--num-classes', type=int, default=1000, metavar='N',
                     help='number of label classes (Model default if None)')
@@ -107,9 +116,9 @@ parser.add_argument('--input-size', default=None, nargs=3, type=int,
                     help='Input all image dimensions (d h w, e.g. --input-size 3 224 224), uses model default if empty')
 parser.add_argument('--crop-pct', default=None, type=float,
                     metavar='N', help='Input image center crop percent (for validation only)')
-parser.add_argument('--mean', type=float, nargs='+', default=None, metavar='MEAN',
+parser.add_argument('--mean', type=float, nargs='+', default=[0.0, 0.0, 0.0], metavar='MEAN',
                     help='Override mean pixel value of dataset')
-parser.add_argument('--std', type=float, nargs='+', default=None, metavar='STD',
+parser.add_argument('--std', type=float, nargs='+', default=[1.0, 1.0, 1.0], metavar='STD',
                     help='Override std deviation of of dataset')
 parser.add_argument('--interpolation', default='', type=str, metavar='NAME',
                     help='Image resize interpolation type (overrides model)')
@@ -119,15 +128,15 @@ parser.add_argument('-vb', '--validation-batch-size', type=int, default=None, me
                     help='validation batch size override (default: None)')
 
 # Optimizer parameters
-parser.add_argument('--opt', default='sgd', type=str, metavar='OPTIMIZER',
+parser.add_argument('--opt', default='adamw', type=str, metavar='OPTIMIZER',
                     help='Optimizer (default: "sgd"')
-parser.add_argument('--opt-eps', default=None, type=float, metavar='EPSILON',
+parser.add_argument('--opt-eps', default=1e-8, type=float, metavar='EPSILON',
                     help='Optimizer Epsilon (default: None, use opt default)')
 parser.add_argument('--opt-betas', default=None, type=float, nargs='+', metavar='BETA',
                     help='Optimizer Betas (default: None, use opt default)')
 parser.add_argument('--momentum', type=float, default=0.9, metavar='M',
                     help='Optimizer momentum (default: 0.9)')
-parser.add_argument('--weight-decay', type=float, default=1e-4,
+parser.add_argument('--weight-decay', type=float, default=0.05,
                     help='weight decay (default: 1e-4)')
 parser.add_argument('--clip-grad', type=float, default=None, metavar='NORM',
                     help='Clip gradient norm (default: None, no clipping)')
@@ -137,9 +146,9 @@ parser.add_argument('--layer-decay', type=float, default=None,
                     help='layer-wise learning rate decay (default: None)')
 
 # Learning rate schedule parameters
-parser.add_argument('--sched', default='step', type=str, metavar='SCHEDULER',
+parser.add_argument('--sched', default='cosine', type=str, metavar='SCHEDULER',
                     help='LR scheduler (default: "step"')
-parser.add_argument('--lr', type=float, default=0.1, metavar='LR',
+parser.add_argument('--lr', type=float, default=1e-5, metavar='LR',
                     help='learning rate (default: 0.05)')
 parser.add_argument('--lr-noise', type=float, nargs='+', default=None, metavar='pct, pct',
                     help='learning rate noise on/off epoch percentages')
@@ -155,11 +164,11 @@ parser.add_argument('--lr-cycle-limit', type=int, default=1, metavar='N',
                     help='learning rate cycle limit, cycles enabled if > 1')
 parser.add_argument('--lr-k-decay', type=float, default=1.0,
                     help='learning rate k-decay for cosine/poly (default: 1.0)')
-parser.add_argument('--warmup-lr', type=float, default=0.0001, metavar='LR',
+parser.add_argument('--warmup-lr', type=float, default=1e-6, metavar='LR',
                     help='warmup learning rate (default: 0.0001)')
 parser.add_argument('--min-lr', type=float, default=1e-6, metavar='LR',
                     help='lower lr bound for cyclic schedulers that hit 0 (1e-5)')
-parser.add_argument('--epochs', type=int, default=90, metavar='N',
+parser.add_argument('--epochs', type=int, default=30, metavar='N',
                     help='number of epochs to train (default: 300)')
 parser.add_argument('--start-epoch', default=None, type=int, metavar='N',
                     help='manual epoch number (useful on restarts)')
@@ -169,9 +178,9 @@ parser.add_argument('--decay-epochs', type=float, default=30, metavar='N',
                     help='epoch interval to decay LR')
 parser.add_argument('--warmup-epochs', type=int, default=0, metavar='N',
                     help='epochs to warmup LR, if scheduler supports')
-parser.add_argument('--cooldown-epochs', type=int, default=0, metavar='N',
+parser.add_argument('--cooldown-epochs', type=int, default=10, metavar='N',
                     help='epochs to cooldown LR at min_lr, after cyclic schedule ends')
-parser.add_argument('--patience-epochs', type=int, default=0, metavar='N',
+parser.add_argument('--patience-epochs', type=int, default=10, metavar='N',
                     help='patience epochs for Plateau LR scheduler (default: 10')
 parser.add_argument('--decay-rate', '--dr', type=float, default=0.1, metavar='RATE',
                     help='LR decay rate (default: 0.1)')
@@ -189,7 +198,7 @@ parser.add_argument('--vflip', type=float, default=0.,
                     help='Vertical flip training aug probability')
 parser.add_argument('--color-jitter', type=float, default=0.4, metavar='PCT',
                     help='Color jitter factor (default: 0.4)')
-parser.add_argument('--aa', type=str, default=None, metavar='NAME',
+parser.add_argument('--aa', type=str, default='rand-m9-mstd0.5-inc1', metavar='NAME',
                     help='Use AutoAugment policy. "v0" or "original". (default: None)'),
 parser.add_argument('--aug-repeats', type=int, default=0,
                     help='Number of augmentation repetitions (distributed training only) (default: 0)')
@@ -201,7 +210,7 @@ parser.add_argument('--bce-loss', action='store_true', default=False,
                     help='Enable BCE loss w/ Mixup/CutMix use.')
 parser.add_argument('--bce-target-thresh', type=float, default=None,
                     help='Threshold for binarizing softened BCE targets (default: None, disabled)')
-parser.add_argument('--reprob', type=float, default=0., metavar='PCT',
+parser.add_argument('--reprob', type=float, default=0.25, metavar='PCT',
                     help='Random erase prob (default: 0.)')
 parser.add_argument('--remode', type=str, default='pixel',
                     help='Random erase mode (default: "pixel")')
@@ -209,9 +218,9 @@ parser.add_argument('--recount', type=int, default=1,
                     help='Random erase count (default: 1)')
 parser.add_argument('--resplit', action='store_true', default=False,
                     help='Do not random erase first (clean) augmentation split')
-parser.add_argument('--mixup', type=float, default=0.0,
+parser.add_argument('--mixup', type=float, default=0.8,
                     help='mixup alpha, mixup enabled if > 0. (default: 0.)')
-parser.add_argument('--cutmix', type=float, default=0.0,
+parser.add_argument('--cutmix', type=float, default=1.0,
                     help='cutmix alpha, cutmix enabled if > 0. (default: 0.)')
 parser.add_argument('--cutmix-minmax', type=float, nargs='+', default=None,
                     help='cutmix min/max ratio, overrides alpha and enables cutmix if set (default: None)')
@@ -223,7 +232,7 @@ parser.add_argument('--mixup-mode', type=str, default='batch',
                     help='How to apply mixup/cutmix params. Per "batch", "pair", or "elem"')
 parser.add_argument('--mixup-off-epoch', default=0, type=int, metavar='N',
                     help='Turn off mixup after this epoch, disabled if 0 (default: 0)')
-parser.add_argument('--smoothing', type=float, default=0.0,
+parser.add_argument('--smoothing', type=float, default=0.1,
                     help='Label smoothing (default: 0.1)')
 parser.add_argument('--train-interpolation', type=str, default='random',
                     help='Training interpolation (random, bilinear, bicubic default: "random")')
@@ -231,7 +240,7 @@ parser.add_argument('--drop', type=float, default=0.0, metavar='PCT',
                     help='Dropout rate (default: 0.)')
 parser.add_argument('--drop-connect', type=float, default=None, metavar='PCT',
                     help='Drop connect rate, DEPRECATED, use drop-path (default: None)')
-parser.add_argument('--drop-path', type=float, default=None, metavar='PCT',
+parser.add_argument('--drop-path', type=float, default=0.25, metavar='PCT',
                     help='Drop path rate (default: None)')
 parser.add_argument('--drop-block', type=float, default=None, metavar='PCT',
                     help='Drop block rate (default: None)')
@@ -251,11 +260,11 @@ parser.add_argument('--split-bn', action='store_true',
                     help='Enable separate BN layers per augmentation split.')
 
 # Model Exponential Moving Average
-parser.add_argument('--model-ema', action='store_true', default=False,
+parser.add_argument('--model-ema', action='store_false', default=True,
                     help='Enable tracking moving average of model weights')
 parser.add_argument('--model-ema-force-cpu', action='store_true', default=False,
                     help='Force ema to be tracked on CPU, rank=0 node only. Disables EMA validation.')
-parser.add_argument('--model-ema-decay', type=float, default=0.9998,
+parser.add_argument('--model-ema-decay', type=float, default=0.99992,
                     help='decay factor for model weights moving average (default: 0.9998)')
 
 # Misc
@@ -273,7 +282,7 @@ parser.add_argument('-j', '--workers', type=int, default=4, metavar='N',
                     help='how many training processes to use (default: 4)')
 parser.add_argument('--save-images', action='store_true', default=False,
                     help='save images of input bathes every log interval for debugging')
-parser.add_argument('--amp', action='store_true', default=False,
+parser.add_argument('--amp', action='store_false', default=True,
                     help='use NVIDIA Apex AMP or Native AMP for mixed precision training')
 parser.add_argument('--apex-amp', action='store_true', default=False,
                     help='Use NVIDIA Apex AMP mixed precision')
@@ -283,9 +292,9 @@ parser.add_argument('--no-ddp-bb', action='store_true', default=False,
                     help='Force broadcast buffers for native DDP to off.')
 parser.add_argument('--channels-last', action='store_true', default=False,
                     help='Use channels_last memory layout')
-parser.add_argument('--pin-mem', action='store_true', default=False,
+parser.add_argument('--pin-mem', action='store_false', default=True,
                     help='Pin CPU memory in DataLoader for more efficient (sometimes) transfer to GPU.')
-parser.add_argument('--output', default='', type=str, metavar='PATH',
+parser.add_argument('--output', default='../../../../output/hal', type=str, metavar='PATH',
                     help='path to output folder (default: none, current dir)')
 parser.add_argument('--experiment', default='', type=str, metavar='NAME',
                     help='name of train experiment, name of sub-folder for output')
@@ -347,7 +356,6 @@ def _parse_args():
 def main():
     setup_default_logging()
     args, args_text = _parse_args()
-
     if args.log_wandb:
         if has_wandb:
             wandb.init(project=args.experiment, config=args)
@@ -355,26 +363,18 @@ def main():
             _logger.warning("You've requested to log metrics to wandb but package not found. "
                             "Metrics not being logged to wandb, try `pip install wandb`")
 
-    args.distributed = False
-    if 'WORLD_SIZE' in os.environ:
-        args.distributed = int(os.environ['WORLD_SIZE']) > 1
-    args.device = 'cuda:0'
-    args.world_size = 1
-    args.rank = 0  # global rank
-    if args.distributed:
-        if 'LOCAL_RANK' not in os.environ:
-            os.environ['LOCAL_RANK'] = str(args.local_rank)
-        args.local_rank = int(os.environ.get("LOCAL_RANK", 0))
-        args.device = 'cuda:%d' % args.local_rank
-        torch.cuda.set_device(args.local_rank)
-        torch.distributed.init_process_group(backend='nccl', init_method='env://')
-        args.world_size = torch.distributed.get_world_size()
-        args.rank = torch.distributed.get_rank()
-        _logger.info('Training in distributed mode with multiple processes, 1 GPU per process. Process %d, total %d.'
-                     % (args.rank, args.world_size))
-    else:
-        _logger.info('Training with a single process on 1 GPUs.')
-    assert args.rank >= 0
+    lim = args.lim
+    nlr = args.nlr
+    eps = args.eps
+    adv = not args.no_adv
+    img_ratio = 0.1
+    train_ratio = 1.
+    val_ratio = 1.
+
+    if args.debug:
+        train_batch_size, val_batch_size = 2, 2
+        img_ratio, train_ratio, val_ratio = 0.001, 0.001, 0.1
+
 
     # resolve AMP arguments based on PyTorch / Apex availability
     use_amp = None
@@ -434,19 +434,6 @@ def main():
     if args.channels_last:
         model = model.to(memory_format=torch.channels_last)
 
-    # setup synchronized BatchNorm for distributed training
-    if args.distributed and args.sync_bn:
-        assert not args.split_bn
-        if has_apex and use_amp == 'apex':
-            # Apex SyncBN preferred unless native amp is activated
-            model = convert_syncbn_model(model)
-        else:
-            model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
-        if args.local_rank == 0:
-            _logger.info(
-                'Converted model to use Synchronized BatchNorm. WARNING: You may have issues if using '
-                'zero initialized BN layers (enabled by default for ResNets) while sync-bn enabled.')
-
     if args.torchscript:
         assert not use_amp == 'apex', 'Cannot use APEX AMP with torchscripted model'
         assert not args.sync_bn, 'Cannot use SyncBatchNorm with torchscripted model'
@@ -476,9 +463,12 @@ def main():
     if args.resume:
         resume_epoch = resume_checkpoint(
             model, args.resume,
-            optimizer=None if args.no_resume_opt else optimizer,
-            loss_scaler=None if args.no_resume_opt else loss_scaler,
+            optimizer=None if not args.resume_opt else optimizer,
+            loss_scaler=None if not args.resume_opt else loss_scaler,
             log_info=args.local_rank == 0)
+
+    # setup distributed training
+    model = nn.DataParallel(model)
 
     # setup exponential moving average of model weights, SWA could be used here too
     model_ema = None
@@ -489,29 +479,16 @@ def main():
         if args.resume:
             load_checkpoint(model_ema.module, args.resume, use_ema=True)
 
-    # setup distributed training
-    if args.distributed:
-        if has_apex and use_amp == 'apex':
-            # Apex DDP preferred unless native amp is activated
-            if args.local_rank == 0:
-                _logger.info("Using NVIDIA APEX DistributedDataParallel.")
-            model = ApexDDP(model, delay_allreduce=True)
-        else:
-            if args.local_rank == 0:
-                _logger.info("Using native Torch DistributedDataParallel.")
-            model = NativeDDP(model, device_ids=[args.local_rank], broadcast_buffers=not args.no_ddp_bb)
-        # NOTE: EMA model does not need to be wrapped by DDP
-
     # setup learning rate schedule and starting epoch
     lr_scheduler, num_epochs = create_scheduler(args, optimizer)
     start_epoch = 0
-    if args.start_epoch is not None:
+    """if args.start_epoch is not None:
         # a specified start_epoch will always override the resume epoch
         start_epoch = args.start_epoch
     elif resume_epoch is not None:
         start_epoch = resume_epoch
     if lr_scheduler is not None and start_epoch > 0:
-        lr_scheduler.step(start_epoch)
+        lr_scheduler.step(start_epoch)"""
 
     if args.local_rank == 0:
         _logger.info('Scheduled epochs: {}'.format(num_epochs))
@@ -527,6 +504,7 @@ def main():
             label_smoothing=args.smoothing, num_classes=args.num_classes)
         mixup_fn = Mixup(**mixup_args)
 
+
     # create data loaders w/ augmentation pipeiine
     train_interpolation = args.train_interpolation
     if args.no_aug or not train_interpolation:
@@ -537,7 +515,7 @@ def main():
     re_num_splits = 0
 
     if args.resplit:
-        # apply RE to second half of batch if no aug split otherwise line up with aug split
+    # apply RE to second half of batch if no aug split otherwise line up with aug split
         re_num_splits = num_aug_splits or 2
     train_transform = create_transform(
         input_size=data_config['input_size'],
@@ -588,18 +566,15 @@ def main():
     print(val_transform)
 
     # create the train and eval datasets
-    dataset_train = ImageNetDataset(args.data_dir, split=args.train_split, transform=train_transform)
-    dataset_eval = ImageNetDataset(args.data_dir, split=args.val_split, transform=val_transform)
+    data_path = Path(args.data_dir)
+    dataset_train = ImageNetDG_10(data_path.joinpath('imagenet/train'), args.info_path, transform=train_transform)
+    dataset_eval = ImageNetDG_10(data_path.joinpath('imagenet/train'), args.info_path, transform=val_transform)
 
     train_sampler = None
     eval_sampler = None
-    if args.distributed:
-        train_sampler = torch.utils.data.distributed.DistributedSampler(dataset_train)
-        eval_sampler = OrderedDistributedSampler(dataset_eval)
 
     loader_train = torch.utils.data.DataLoader(
         dataset_train,
-        sampler=train_sampler,
         shuffle=train_sampler is None,
         batch_size=args.batch_size,
         num_workers=args.workers,
@@ -610,7 +585,6 @@ def main():
 
     loader_eval = torch.utils.data.DataLoader(
         dataset_eval,
-        sampler=eval_sampler,
         shuffle=False,
         batch_size=int(1.5 * args.batch_size),
         num_workers=args.workers,
@@ -645,45 +619,56 @@ def main():
     best_epoch = None
     saver = None
     output_dir = None
-    if args.rank == 0:
-        if args.experiment:
-            exp_name = args.experiment
-        else:
-            exp_name = '-'.join([
-                datetime.now().strftime("%Y%m%d-%H%M%S"),
-                safe_model_name(args.model),
-                str(data_config['input_size'][-1])
-            ])
-        output_dir = get_outdir(args.output if args.output else './output/train', exp_name)
-        decreasing = True if eval_metric == 'loss' else False
-        saver = CheckpointSaver(
-            model=model, optimizer=optimizer, args=args, model_ema=model_ema, amp_scaler=loss_scaler,
-            checkpoint_dir=output_dir, recovery_dir=output_dir, decreasing=decreasing, max_history=args.checkpoint_hist)
+    if args.experiment:
+        exp_name = args.experiment
+    else:
+        exp_name = '-'.join([
+            datetime.now().strftime("%Y%m%d-%H%M%S"),
+            safe_model_name(args.model),
+            str(data_config['input_size'][-1])
+        ])
+    output_dir = Path(os.path.join(args.output, exp_name))
+    noise_path = output_dir.joinpath("noise")
+    model_path = output_dir.joinpath("model")
+
+    if args.local_rank == 0:
+        noise_path.mkdir(exist_ok=True, parents=True)
+        model_path.mkdir(exist_ok=True, parents=True)
         with open(os.path.join(output_dir, 'args.yaml'), 'w') as f:
             f.write(args_text)
 
+    start_epoch = len(list(model_path.iterdir()))
+    if start_epoch > 0:
+        print(f"Restore training from epoch {start_epoch}")
+        checkpoint = torch.load(model_path.joinpath(str(start_epoch - 1)))
+        model.module.load_state_dict(checkpoint["model_state_dict"])
+        model_ema.module.module.load_state_dict(checkpoint["state_dict_ema"])
+        optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+        lr_scheduler.step(start_epoch)
+        best_acc = torch.load(setting_path.joinpath("best_epoch"))["best_acc"]
+        print(f"Previous best acc: {best_acc}")
+
     try:
         for epoch in range(start_epoch, num_epochs):
-            if args.distributed and hasattr(loader_train.sampler, 'set_epoch'):
-                loader_train.sampler.set_epoch(epoch)
+            if Path.exists(noise_path.joinpath(str(epoch))):
+                print(f"Loading learned noise at epoch {epoch}")
+                delta_x = torch.load(noise_path.joinpath(str(epoch)))['delta_x']
+            else:
+                print("---- Learning noise")
+                delta_x = encoder_level_epsilon_noise(model, img_loader, img_size, rounds, nlr, lim, eps, img_ratio)
+                torch.save({"delta_x": delta_x}, noise_path.joinpath(str(epoch)))
+
 
             train_metrics = train_one_epoch(
-                epoch, model, loader_train, optimizer, train_loss_fn, args,
+                epoch, model, loader_train, optimizer, train_loss_fn, args, adv, delta_x, train_ratio,
                 lr_scheduler=lr_scheduler, saver=saver, output_dir=output_dir,
                 amp_autocast=amp_autocast, loss_scaler=loss_scaler, model_ema=model_ema, mixup_fn=mixup_fn)
 
-            if args.distributed and args.dist_bn in ('broadcast', 'reduce'):
-                if args.local_rank == 0:
-                    _logger.info("Distributing BatchNorm running means and vars")
-                distribute_bn(model, args.world_size, args.dist_bn == 'reduce')
-
-            eval_metrics = validate(model, loader_eval, validate_loss_fn, args, amp_autocast=amp_autocast)
+            eval_metrics = validate(model, loader_eval, validate_loss_fn, args, val_ratio, amp_autocast=amp_autocast)
 
             if model_ema is not None and not args.model_ema_force_cpu:
-                if args.distributed and args.dist_bn in ('broadcast', 'reduce'):
-                    distribute_bn(model_ema, args.world_size, args.dist_bn == 'reduce')
                 ema_eval_metrics = validate(
-                    model_ema.module, loader_eval, validate_loss_fn, args, amp_autocast=amp_autocast,
+                    model_ema.module, loader_eval, validate_loss_fn, args, val_ratio, amp_autocast=amp_autocast,
                     log_suffix=' (EMA)')
                 eval_metrics = ema_eval_metrics
 
@@ -696,10 +681,24 @@ def main():
                     epoch, train_metrics, eval_metrics, os.path.join(output_dir, 'summary.csv'),
                     write_header=best_metric is None, log_wandb=args.log_wandb and has_wandb)
 
-            if saver is not None:
-                # save proper checkpoint with eval metric
-                save_metric = eval_metrics[eval_metric]
-                best_metric, best_epoch = saver.save_checkpoint(epoch, metric=save_metric)
+            torch.save({"model_name": model_name, "epoch": epoch,
+                        "model_state_dict": model.module.state_dict(),
+                        "state_dict_ema": model_ema.module.module.state_dict(),
+                        "optimizer_state_dict": optimizer.state_dict(),
+                        "scheduler_state_dict": scheduler.state_dict(),
+                        "result": eval_metrics[eval_metric]}, model_path.joinpath(str(epoch)))
+
+            if best_metric is None or eval_metrics[eval_metric] > best_metric:
+                best_metric = eval_metrics[eval_metric]
+                best_epoch = epoch
+                print(f'New Best Acc: {best_metric:.2f}%')
+                try:
+                    torch.save(
+                        {"model_state_dict": model.module.state_dict(),
+                         "state_dict_ema": model_ema.module.state_dict(),
+                         "best_epoch": epoch, "best_acc": best_metric}, output_dir.joinpath("best_epoch"))
+                except FileExistsError:
+                    print("File exists")
 
     except KeyboardInterrupt:
         pass
@@ -708,7 +707,7 @@ def main():
 
 
 def train_one_epoch(
-        epoch, model, loader, optimizer, loss_fn, args,
+        epoch, model, loader, optimizer, loss_fn, args, adv, delta_x, train_ratio,
         lr_scheduler=None, saver=None, output_dir=None, amp_autocast=suppress,
         loss_scaler=None, model_ema=None, mixup_fn=None):
     if args.mixup_off_epoch and epoch >= args.mixup_off_epoch:
@@ -725,7 +724,7 @@ def train_one_epoch(
     ddconfig = {'double_z': False, 'z_channels': 4, 'resolution': 256, 'in_channels': 3, 'out_ch': 3, 'ch': 128,
                 'ch_mult': [1, 2, 2, 4], 'num_res_blocks': 2, 'attn_resolutions': [32], 'dropout': 0.0}
     vqgan_aug = VQModel(ddconfig, n_embed=16384, embed_dim=4,
-                        ckpt_path='http://alisec-competition.oss-cn-shanghai.aliyuncs.com/xiaofeng/easy_robust/pretrained_models/vqgan_openimages_f8_16384.ckpt')
+                        ckpt_path='../../../../pretrained/vqgan_openimages_f8_16384.ckpt')
     vqgan_aug = vqgan_aug.cuda()
     vqgan_aug.eval()
 
@@ -733,6 +732,8 @@ def train_one_epoch(
     last_idx = len(loader) - 1
     num_updates = epoch * len(loader)
     for batch_idx, (input, target) in enumerate(loader):
+        if batch_idx > int(train_ratio * len(loader)):
+            break
         last_batch = batch_idx == last_idx
         data_time_m.update(time.time() - end)
 
@@ -760,8 +761,16 @@ def train_one_epoch(
             output2 = model(adv_xrec)
             loss += loss_fn(output2, target)
 
-        if not args.distributed:
-            losses_m.update(loss.item(), input.size(0))
+        if adv:
+            x = model.module.patch_embed(input)
+            x = x + delta_x.cuda(non_blocking=True)
+            adv_outputs = model.module.head(encoder_forward(model, x))
+            adv_loss = loss_fn(adv_outputs, target)
+            # adv_loss.backward()
+            consistency = ((adv_outputs - output) ** 2).sum(dim=-1).mean()
+            loss = loss + adv_loss
+
+        losses_m.update(loss.item(), input.size(0))
 
         optimizer.zero_grad()
         if loss_scaler is not None:
@@ -788,10 +797,6 @@ def train_one_epoch(
             lrl = [param_group['lr'] for param_group in optimizer.param_groups]
             lr = sum(lrl) / len(lrl)
 
-            if args.distributed:
-                reduced_loss = reduce_tensor(loss.data, args.world_size)
-                losses_m.update(reduced_loss.item(), input.size(0))
-
             if args.local_rank == 0:
                 _logger.info(
                     'Train: {} [{:>4d}/{} ({:>3.0f}%)]  '
@@ -817,9 +822,6 @@ def train_one_epoch(
                         padding=0,
                         normalize=True)
 
-        if saver is not None and args.recovery_interval and (
-                last_batch or (batch_idx + 1) % args.recovery_interval == 0):
-            saver.save_recovery(epoch, batch_idx=batch_idx)
 
         if lr_scheduler is not None:
             lr_scheduler.step_update(num_updates=num_updates, metric=losses_m.avg)
@@ -833,24 +835,28 @@ def train_one_epoch(
     return OrderedDict([('loss', losses_m.avg)])
 
 
-def validate(model, loader, loss_fn, args, amp_autocast=suppress, log_suffix=''):
+def validate(model, loader, loss_fn, args, val_ratio, amp_autocast=suppress, log_suffix='', adv=False):
     batch_time_m = AverageMeter()
     losses_m = AverageMeter()
     top1_m = AverageMeter()
     top5_m = AverageMeter()
 
     model.eval()
-
+    if adv:
+        attack = torchattacks.FGSM(model, eps=8 / 225)
     end = time.time()
     last_idx = len(loader) - 1
     with torch.no_grad():
         for batch_idx, (input, target) in enumerate(loader):
+            if batch_idx > int(val_ratio * len(loader)):
+                break
             last_batch = batch_idx == last_idx
             input = input.cuda()
             target = target.cuda()
             if args.channels_last:
                 input = input.contiguous(memory_format=torch.channels_last)
-
+            if adv:
+                input = attack(input, target)
             with amp_autocast():
                 output = model(input)
             if isinstance(output, (tuple, list)):
@@ -865,12 +871,7 @@ def validate(model, loader, loss_fn, args, amp_autocast=suppress, log_suffix='')
             loss = loss_fn(output, target)
             acc1, acc5 = accuracy(output, target, topk=(1, 5))
 
-            if args.distributed:
-                reduced_loss = reduce_tensor(loss.data, args.world_size)
-                acc1 = reduce_tensor(acc1, args.world_size)
-                acc5 = reduce_tensor(acc5, args.world_size)
-            else:
-                reduced_loss = loss.data
+            reduced_loss = loss.data
 
             torch.cuda.synchronize()
 

@@ -532,7 +532,8 @@ class VQModel(nn.Module):
             self.init_from_ckpt(ckpt_path, ignore_keys=ignore_keys)
 
     def init_from_ckpt(self, path, ignore_keys=list()):
-        sd = model_zoo.load_url(path, map_location="cpu")["state_dict"]
+        #sd = model_zoo.load_url(path, map_location="cpu")["state_dict"]
+        sd = torch.load(path, map_location="cpu")["state_dict"]
         keys = list(sd.keys())
         for k in keys:
             for ik in ignore_keys:

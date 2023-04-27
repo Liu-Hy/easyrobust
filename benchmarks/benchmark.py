@@ -123,13 +123,25 @@ def main():
         evaluate_imagenet_autoattack(model, os.path.join(args.data_dir, 'imagenet-val'), test_batchsize=args.batch_size, test_transform=test_transform)
     else:
         # Non-Adversarial Robust Models Benchmark
-        evaluate_imagenet_val(model, os.path.join(args.data_dir, 'imagenet-val'), test_batchsize=args.batch_size, test_transform=test_transform)
+        #evaluate_imagenet_val(model, os.path.join(args.data_dir, 'imagenet', 'val'), test_batchsize=args.batch_size,
+                              #test_transform=test_transform)
+        """evaluate_imagenet_a(model, os.path.join(args.data_dir, 'imagenet', 'adversarial', 'val'),
+                              test_batchsize=args.batch_size,
+                              test_transform=test_transform)
+        evaluate_imagenet_r(model, os.path.join(args.data_dir, 'imagenet', 'rendition', 'val'),
+                              test_batchsize=args.batch_size,
+                              test_transform=test_transform)"""
+        evaluate_imagenet_sketch(model, os.path.join(args.data_dir, 'imagenet', 'sketch'), test_batchsize=args.batch_size,
+                              test_transform=test_transform)
+        evaluate_imagenet_v2(model, os.path.join(args.data_dir, 'imagenet', 'v2'), test_batchsize=args.batch_size,
+                              test_transform=test_transform)
+        """evaluate_imagenet_val(model, os.path.join(args.data_dir, 'imagenet-val'), test_batchsize=args.batch_size, test_transform=test_transform)
         evaluate_imagenet_a(model, os.path.join(args.data_dir, 'imagenet-a'), test_batchsize=args.batch_size, test_transform=test_transform)
         evaluate_imagenet_r(model, os.path.join(args.data_dir, 'imagenet-r'), test_batchsize=args.batch_size, test_transform=test_transform)
         evaluate_imagenet_sketch(model, os.path.join(args.data_dir, 'imagenet-sketch'), test_batchsize=args.batch_size, test_transform=test_transform)
         evaluate_imagenet_v2(model, os.path.join(args.data_dir, 'imagenetv2'), test_batchsize=args.batch_size, test_transform=test_transform)
         evaluate_stylized_imagenet(model, os.path.join(args.data_dir, 'imagenet-style'), test_batchsize=args.batch_size, test_transform=test_transform)
-        evaluate_imagenet_c(model, os.path.join(args.data_dir, 'imagenet-c'), test_batchsize=args.batch_size, test_transform=test_transform)
+        evaluate_imagenet_c(model, os.path.join(args.data_dir, 'imagenet-c'), test_batchsize=args.batch_size, test_transform=test_transform)"""
 
 if __name__ == '__main__':
     main()
