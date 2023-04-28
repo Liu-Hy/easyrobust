@@ -130,7 +130,7 @@ def main(local_rank, args, args_text):
     lim = args.lim
     nlr = args.nlr
     eps = args.eps
-    adv = False #not args.no_adv
+    adv = not args.no_adv
     img_ratio = 0.1
     train_ratio = 1.
     val_ratio = 1.
@@ -139,9 +139,9 @@ def main(local_rank, args, args_text):
         args.batch_size = 2
         img_ratio, train_ratio, val_ratio = 0.001, 0.001, 0.1
 
-    args.distributed = False
-    if 'WORLD_SIZE' in os.environ:
-        args.distributed = int(os.environ['WORLD_SIZE']) > 1
+    args.distributed = True
+    """if 'WORLD_SIZE' in os.environ:
+        args.distributed = int(os.environ['WORLD_SIZE']) > 1"""
     args.device = 'cuda:0'
     args.world_size = 1
     args.rank = 0  # global rank
@@ -387,16 +387,13 @@ def main(local_rank, args, args_text):
     dataset_train = hfai.datasets.ImageNet('train', transform=train_transform)
     dataset_eval = hfai.datasets.ImageNet('val', transform=val_transform)
 
-    train_sampler = None
-    eval_sampler = None
-    if args.distributed:
-        train_sampler = torch.utils.data.distributed.DistributedSampler(dataset_train)
-        eval_sampler = OrderedDistributedSampler(dataset_eval)
+    train_sampler = torch.utils.data.distributed.DistributedSampler(dataset_train)
+    img_sampler = torch.utils.data.distributed.DistributedSampler(dataset_train)
+    eval_sampler = OrderedDistributedSampler(dataset_eval)
 
     loader_train = DataLoader(
         dataset_train,
         sampler=train_sampler,
-        shuffle=train_sampler is None,
         batch_size=args.batch_size,
         num_workers=args.workers,
         pin_memory=args.pin_mem,
@@ -407,7 +404,6 @@ def main(local_rank, args, args_text):
     loader_eval = DataLoader(
         dataset_eval,
         sampler=eval_sampler,
-        shuffle=False,
         batch_size=int(1.5 * args.batch_size),
         num_workers=args.workers,
         pin_memory=args.pin_mem,
@@ -415,9 +411,9 @@ def main(local_rank, args, args_text):
         persistent_workers=False
     )
 
-    loader_img = torch.utils.data.DataLoader(
+    loader_img = DataLoader(
         dataset_train,
-        shuffle=train_sampler is None,
+        sampler=img_sampler,
         batch_size=args.batch_size,
         num_workers=args.workers,
         pin_memory=args.pin_mem,
@@ -506,7 +502,8 @@ def main(local_rank, args, args_text):
             if delta_x is None:
                 if local_rank == 0:
                     print("---- Learning noise")
-                img_size = model.module[1].patch_embed.img_size[0]
+                img_size = data_config["input_size"][-1]
+                assert img_size == 224
                 delta_x = encoder_level_epsilon_noise(model, loader_img, img_size, rounds, nlr, lim, eps, img_ratio,
                                                       disable=True)
                 torch.save({"delta_x": delta_x}, noise_path.joinpath(str(epoch)))
@@ -519,6 +516,7 @@ def main(local_rank, args, args_text):
                 amp_autocast=amp_autocast, loss_scaler=loss_scaler, model_ema=model_ema, mixup_fn=mixup_fn)
 
             start_step = 0
+            delta_x = None
 
             if args.distributed and args.dist_bn in ('broadcast', 'reduce'):
                 if args.local_rank == 0:
@@ -544,6 +542,7 @@ def main(local_rank, args, args_text):
                     write_header=best_metric is None, log_wandb=args.log_wandb and has_wandb)
 
             if args.rank == 0:
+                print(f'Acc: {eval_metrics}')
                 if best_metric is None or eval_metrics[eval_metric] > best_metric:
                     best_metric = eval_metrics[eval_metric]
                     best_epoch = epoch
@@ -973,7 +972,7 @@ if __name__ == '__main__':
                         help='random seed (default: 42)')
     parser.add_argument('--worker-seeding', type=str, default='all',
                         help='worker seed mode (default: all)')
-    parser.add_argument('--log-interval', type=int, default=50, metavar='N',
+    parser.add_argument('--log-interval', type=int, default=100, metavar='N',
                         help='how many batches to wait before logging training status')
     parser.add_argument('--recovery-interval', type=int, default=0, metavar='N',
                         help='how many batches to wait before writing recovery checkpoint')

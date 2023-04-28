@@ -123,7 +123,7 @@ parser.add_argument('--std', type=float, nargs='+', default=[1.0, 1.0, 1.0], met
                     help='Override std deviation of of dataset')
 parser.add_argument('--interpolation', default='', type=str, metavar='NAME',
                     help='Image resize interpolation type (overrides model)')
-parser.add_argument('-b', '--batch-size', type=int, default=128, metavar='N',
+parser.add_argument('-b', '--batch-size', type=int, default=24, metavar='N',
                     help='input batch size for training (default: 128)')
 parser.add_argument('-vb', '--validation-batch-size', type=int, default=None, metavar='N',
                     help='validation batch size override (default: None)')
@@ -273,7 +273,7 @@ parser.add_argument('--seed', type=int, default=42, metavar='S',
                     help='random seed (default: 42)')
 parser.add_argument('--worker-seeding', type=str, default='all',
                     help='worker seed mode (default: all)')
-parser.add_argument('--log-interval', type=int, default=50, metavar='N',
+parser.add_argument('--log-interval', type=int, default=500, metavar='N',
                     help='how many batches to wait before logging training status')
 parser.add_argument('--recovery-interval', type=int, default=0, metavar='N',
                     help='how many batches to wait before writing recovery checkpoint')
@@ -667,10 +667,11 @@ def main():
                 delta_x = torch.load(noise_path.joinpath(str(epoch)))['delta_x']
             else:
                 print("---- Learning noise")
-                img_size = model.module[1].patch_embed.img_size[0]
+                img_size = data_config["input_size"][-1]
+                assert img_size == 224
                 delta_x = encoder_level_epsilon_noise(model, loader_img, img_size, rounds, nlr, lim, eps, img_ratio)
                 torch.save({"delta_x": delta_x}, noise_path.joinpath(str(epoch)))
-
+                print(f"Noise norm: {round(torch.norm(delta_x).item(), 4)}")
 
             train_metrics = train_one_epoch(
                 epoch, model, loader_train, optimizer, train_loss_fn, args, adv, delta_x, train_ratio,
