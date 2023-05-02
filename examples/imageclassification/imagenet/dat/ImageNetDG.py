@@ -11,15 +11,7 @@ from hfai.datasets.base import (
     register_dataset
 )
 from ffrecord.torch import Dataset, DataLoader
-
-CORRUPTIONS = ['gaussian_noise', 'shot_noise', 'impulse_noise', 'defocus_blur', 'glass_blur', 'motion_blur',
-               'zoom_blur', 'snow', 'frost', 'fog', 'brightness', 'contrast', 'elastic_transform', 'pixelate',
-               'jpeg_compression']
-
-SPLITS = ["train", "val", "adversarial", "damagenet", "rendition", "sketch", "v2"]
-for c in CORRUPTIONS:
-    for s in range(1, 6):
-        SPLITS.append("c-" + c + "-" + str(s))
+from constants import *
 
 """
 Expected file organization:

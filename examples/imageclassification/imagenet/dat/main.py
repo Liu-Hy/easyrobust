@@ -30,10 +30,11 @@ import hfai.distributed as dist
 import torch
 import torch.nn as nn
 import torchvision.utils
+from torchvision import transforms
 from torch.nn.parallel import DistributedDataParallel as NativeDDP
 
 from timm.data import resolve_data_config, Mixup
-from timm.models import create_model, safe_model_name, resume_checkpoint, load_checkpoint,\
+from timm.models import create_model, safe_model_name, resume_checkpoint, load_checkpoint, \
     convert_splitbn_model, model_parameters
 from timm.utils import *
 from timm.loss import *
@@ -43,7 +44,8 @@ from timm.utils import ApexScaler, NativeScaler
 from timm.data import create_transform
 from timm.data.distributed_sampler import OrderedDistributedSampler
 
-from utils import encoder_forward, encoder_level_epsilon_noise
+from utils import encoder_forward, encoder_level_epsilon_noise, get_mean
+from constants import *
 from ImageNetDG import ImageNetDG
 from vqgan import VQModel, reconstruct_with_vqgan
 from easyrobust.attacks import pgd_generator
@@ -55,6 +57,7 @@ try:
     from apex import amp
     from apex.parallel import DistributedDataParallel as ApexDDP
     from apex.parallel import convert_syncbn_model
+
     has_apex = True
 except ImportError:
     has_apex = False
@@ -68,6 +71,7 @@ except AttributeError:
 
 try:
     import wandb
+
     has_wandb = True
 except ImportError:
     has_wandb = False
@@ -82,6 +86,7 @@ def normalize_fn(tensor, mean, std):
     mean = mean[None, :, None, None]
     std = std[None, :, None, None]
     return tensor.sub(mean).div(std)
+
 
 class NormalizeByChannelMeanStd(nn.Module):
     def __init__(self, mean, std):
@@ -99,6 +104,7 @@ class NormalizeByChannelMeanStd(nn.Module):
     def extra_repr(self):
         return 'mean={}, std={}'.format(self.mean, self.std)
 
+
 def _parse_args():
     # Do we have a config file to parse?
     args_config, remaining = config_parser.parse_known_args()
@@ -115,14 +121,39 @@ def _parse_args():
     args_text = yaml.safe_dump(args.__dict__, default_flow_style=False)
     return args, args_text
 
+def get_val_transform(config, split):
+    normalize = transforms.Normalize(config['mean'], config['std'])
+
+    # ImageNet-C and ImageNet-Stylized are already 224 x 224 images
+    if split in ["corruption", "stylized"]:
+        val_transform = transforms.Compose([
+            transforms.ToTensor(),
+            normalize])
+    else:
+        val_transform = transforms.Compose([
+            transforms.Resize(256, interpolation=transforms.InterpolationMode.BICUBIC),
+            transforms.CenterCrop(224),
+            transforms.ToTensor(),
+            normalize])
+    return val_transform
+
+def prepare_loader(args, split_data, transform=None):
+    if isinstance(split_data, str):
+        split_data = ImageNetDG(split_data, transform=transform)
+    data_sampler = torch.utils.data.distributed.DistributedSampler(split_data)
+    data_loader = DataLoader(split_data,
+                             sampler=data_sampler,
+                             batch_size=int(1.5 * args.batch_size),
+                             num_workers=args.workers,
+                             pin_memory=args.pin_mem,
+                             persistent_workers=False)
+    return data_loader
 
 def main(local_rank, args, args_text):
-    #_logger = logging.getLogger('train')
-    # setup_default_logging()
     if args.log_wandb:
         if has_wandb:
             wandb.init(project=args.experiment, config=args)
-        else: 
+        else:
             _logger.warning("You've requested to log metrics to wandb but package not found. "
                             "Metrics not being logged to wandb, try `pip install wandb`")
 
@@ -221,7 +252,7 @@ def main(local_rank, args, args_text):
         model = convert_splitbn_model(model, max(num_aug_splits, 2))
 
     normalize = NormalizeByChannelMeanStd(
-            mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+        mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
     model = nn.Sequential(normalize, model)
 
     # move model to GPU, enable channels last layout if set
@@ -335,6 +366,7 @@ def main(local_rank, args, args_text):
     if args.resplit:
     # apply RE to second half of batch if no aug split otherwise line up with aug split
         re_num_splits = num_aug_splits or 2
+
     train_transform = create_transform(
         input_size=data_config['input_size'],
         is_training=True,
@@ -357,7 +389,7 @@ def main(local_rank, args, args_text):
         re_num_splits=re_num_splits,
         separate=num_aug_splits > 0,
     )
-    val_transform = create_transform(
+    """val_transform = create_transform(  # 可能要改
         input_size=data_config['input_size'],
         is_training=False,
         use_prefetcher=False,
@@ -378,18 +410,19 @@ def main(local_rank, args, args_text):
         re_count=1,
         re_num_splits=re_num_splits,
         separate=num_aug_splits > 0,
-    )
+    )"""
 
-    print(train_transform)
-    print(val_transform)
+    # print(train_transform)
+    # print(val_transform)
+
 
     # create the train and eval datasets
     dataset_train = hfai.datasets.ImageNet('train', transform=train_transform)
-    dataset_eval = hfai.datasets.ImageNet('val', transform=val_transform)
+    # dataset_eval = hfai.datasets.ImageNet('val', transform=val_transform)
 
     train_sampler = torch.utils.data.distributed.DistributedSampler(dataset_train)
     img_sampler = torch.utils.data.distributed.DistributedSampler(dataset_train)
-    eval_sampler = OrderedDistributedSampler(dataset_eval)
+    # eval_sampler = OrderedDistributedSampler(dataset_eval)
 
     loader_train = DataLoader(
         dataset_train,
@@ -401,7 +434,7 @@ def main(local_rank, args, args_text):
         persistent_workers=False
     )
 
-    loader_eval = DataLoader(
+    """loader_eval = DataLoader(
         dataset_eval,
         sampler=eval_sampler,
         batch_size=int(1.5 * args.batch_size),
@@ -409,7 +442,7 @@ def main(local_rank, args, args_text):
         pin_memory=args.pin_mem,
         drop_last=False, 
         persistent_workers=False
-    )
+    )"""
 
     loader_img = DataLoader(
         dataset_train,
@@ -451,7 +484,7 @@ def main(local_rank, args, args_text):
         exp_name = args.experiment
     else:
         exp_name = '-'.join([
-            datetime.now().strftime("%Y%m%d-%H%M%S"),
+            # datetime.now().strftime("%Y%m%d-%H%M%S"),
             safe_model_name(args.model),
             str(data_config['input_size'][-1])
         ])
@@ -476,10 +509,14 @@ def main(local_rank, args, args_text):
         start_epoch, start_step, others = 0, 0, None
         print("Failed to load checkpoint, start from scratch instead.")
 
-    best_metric, delta_x, state_dict_ema = 0., None, None
+    best_metric, delta_x, state_dict_ema = None, None, None
     if others is not None:
         best_metric, delta_x, state_dict_ema = others
         model_ema.module.load_state_dict(state_dict_ema)
+
+    if (start_epoch == 0) and (start_step == 0):
+        result, avg_result = validate_all(model_ema, args, data_config, validate_loss_fn, val_ratio, True)
+        best_metric = avg_result
 
     try:
         for epoch in range(start_epoch, num_epochs):
@@ -488,17 +525,6 @@ def main(local_rank, args, args_text):
 
             loader_train.set_step(start_step)
 
-            if epoch == 0 and start_step == 0:
-                if model_ema is not None and not args.model_ema_force_cpu:
-                    if args.distributed and args.dist_bn in ('broadcast', 'reduce'):
-                        distribute_bn(model_ema, args.world_size, args.dist_bn == 'reduce')
-                    ema_eval_metrics = validate(
-                        model_ema.module, loader_eval, validate_loss_fn, args, val_ratio, amp_autocast=amp_autocast,
-                        log_suffix=' (EMA)')
-                    if args.rank == 0:
-                        best_metric = ema_eval_metrics[eval_metric]
-                        print(f'Original Acc: {best_metric:.2f}%')
-
             if delta_x is None:
                 if local_rank == 0:
                     print("---- Learning noise")
@@ -506,6 +532,7 @@ def main(local_rank, args, args_text):
                 assert img_size == 224
                 delta_x = encoder_level_epsilon_noise(model, loader_img, img_size, rounds, nlr, lim, eps, img_ratio,
                                                       disable=True)
+            if args.rank == 0:
                 torch.save({"delta_x": delta_x}, noise_path.joinpath(str(epoch)))
             if local_rank == 0:
                 print(f"Noise norm: {round(torch.norm(delta_x).item(), 4)}")
@@ -523,37 +550,40 @@ def main(local_rank, args, args_text):
                     _logger.info("Distributing BatchNorm running means and vars")
                 distribute_bn(model, args.world_size, args.dist_bn == 'reduce')
             
-            eval_metrics = validate(model, loader_eval, validate_loss_fn, args, val_ratio, amp_autocast=amp_autocast)
-
-            if model_ema is not None and not args.model_ema_force_cpu:
-                if args.distributed and args.dist_bn in ('broadcast', 'reduce'):
-                    distribute_bn(model_ema, args.world_size, args.dist_bn == 'reduce')
-                ema_eval_metrics = validate(
-                    model_ema.module, loader_eval, validate_loss_fn, args, val_ratio, amp_autocast=amp_autocast, log_suffix=' (EMA)')
-                eval_metrics = ema_eval_metrics
-
+            # eval_metrics = validate(model, loader_eval, validate_loss_fn, args, val_ratio, amp_autocast=amp_autocast)[0]
             if lr_scheduler is not None:
                 # step LR for next epoch
-                lr_scheduler.step(epoch + 1, eval_metrics[eval_metric])
+                lr_scheduler.step(epoch + 1)
 
-            if output_dir is not None:
-                update_summary(
-                    epoch, train_metrics, eval_metrics, os.path.join(output_dir, 'summary.csv'),
-                    write_header=best_metric is None, log_wandb=args.log_wandb and has_wandb)
+            if epoch % 5 == 0:
+                result, avg_result = validate_all(model_ema, args, data_config, validate_loss_fn, val_ratio, False)
+                """if output_dir is not None:
+                    update_summary(
+                        epoch, train_metrics, result, os.path.join(output_dir, 'summary.csv'),
+                        write_header=best_metric is None, log_wandb=args.log_wandb and has_wandb)"""
 
-            if args.rank == 0:
-                print(f'Acc: {eval_metrics}')
-                if best_metric is None or eval_metrics[eval_metric] > best_metric:
-                    best_metric = eval_metrics[eval_metric]
-                    best_epoch = epoch
-                    print(f'New Best Acc: {best_metric:.2f}%')
+                if local_rank == 0:
                     try:
-                        torch.save(
-                            {"model_state_dict": model.module.state_dict(),
-                             "state_dict_ema": model_ema.module.state_dict(),
-                             "best_epoch": epoch, "best_acc": best_metric}, output_dir.joinpath("best_epoch"))
+                        torch.save({"model_name": safe_model_name(args.model), "epoch": epoch,
+                                    "model_state_dict": model.module.state_dict(),
+                                    "state_dict_ema": model_ema.module.state_dict(),
+                                    "optimizer_state_dict": optimizer.state_dict(),
+                                    "result": result}, model_path.joinpath(str(epoch)))
                     except FileExistsError:
                         print("File exists")
+
+                if best_metric is None or avg_result > best_metric:
+                    best_metric = avg_result
+                    best_epoch = epoch
+                    if args.rank == 0:
+                        print(f'New Best Acc: {best_metric:.2f}%')
+                        try:
+                            torch.save(
+                                {"model_state_dict": model.module.state_dict(),
+                                 "state_dict_ema": model_ema.module.state_dict(),
+                                 "best_epoch": epoch, "best_acc": best_metric}, output_dir.joinpath("best_epoch"))
+                        except FileExistsError:
+                            print("File exists")
 
     except KeyboardInterrupt:
         pass
@@ -695,8 +725,103 @@ def train_one_epoch(
 
     return OrderedDict([('loss', losses_m.avg)])
 
+def validate_all(model_ema, args, data_config, validate_loss_fn, val_ratio, is_origin):
+    assert (model_ema is not None) and (not args.model_ema_force_cpu)
+    if args.distributed and args.dist_bn in ('broadcast', 'reduce') and not is_origin:
+        distribute_bn(model_ema, args.world_size, args.dist_bn == 'reduce')
 
-def validate(model, loader, loss_fn, args, val_ratio, amp_autocast=suppress, log_suffix='', adv=False):
+    result = dict()
+    # Evaluate on val and OOD datasets except imagenet-c
+    for split in SPLITS:
+        if not split.startswith("c-"):
+            # Use a logits mask to evaluate on 200-class validation sets
+            if split == "adversarial":
+                mask = imagenet_a_mask
+            elif split == "rendition":
+                mask = imagenet_r_mask
+            else:
+                mask = None
+            val_transform = get_val_transform(data_config, split)
+            if split == "val":
+                dts = hfai.datasets.ImageNet('val', transform=val_transform)
+                loader_eval = prepare_loader(args, dts)
+            else:
+                loader_eval = prepare_loader(args, split, val_transform)
+            acc = validate(loader_eval, model_ema.module, validate_loss_fn, val_ratio, mask=mask)[0]
+
+            result[split] = acc
+            # Evaluate adversarial robustness on the validation set.
+            if split == "val":
+                result["fgsm"] = validate(loader_eval, model_ema.module, validate_loss_fn, val_ratio, adv="FGSM")[0]
+    # Evaluate on imagenet-c
+    c_transform = get_val_transform(data_config, "corruption")
+    corruption_rs = validate_corruption(args, model_ema.module, c_transform, validate_loss_fn, 0.1)
+    result["corruption"] = corruption_rs["mce"]
+    avg_result = get_mean([100 - v if k == "corruption" else v for k, v in result.items()])
+    if args.rank == 0:
+        if is_origin:
+            print(f"Original performance: {avg_result}\n", result)
+        else:
+            print(f"Avg performance: {avg_result}\n", result)
+    return result, avg_result
+
+def validate(dataloader, model, criterion, val_ratio, mask=None, adv='none', eps=8/225):
+    loss, correct1, correct5, total = torch.zeros(4).cuda()
+    model.eval()
+    assert adv in ['none', 'FGSM', 'Linf', 'L2'], '{} is not supported!'.format(adv)
+    if adv == "FGSM":
+        attack = torchattacks.FGSM(model, eps=8 / 225)
+    elif adv != "none":
+        attack = AutoAttack(model, norm=adv, eps=eps, version='standard', n_classes=1000)
+    for step, batch in enumerate(dataloader):
+        if step > int(val_ratio * len(dataloader)):
+            break
+        samples, labels = [x.cuda(non_blocking=True) for x in batch]
+        if adv != "none":
+            samples = attack(samples, labels)
+        with torch.no_grad():
+            outputs = model(samples)
+            if mask is not None:
+                outputs[:, mask] = -float('inf')
+            loss += criterion(outputs, labels)
+            _, preds = outputs.topk(5, -1, True, True)
+            correct1 += torch.eq(preds[:, :1], labels.unsqueeze(1)).sum()
+            correct5 += torch.eq(preds, labels.unsqueeze(1)).sum()
+            total += samples.size(0)
+
+    for x in [loss, correct1, correct5, total]:
+        dist.reduce(x, 0)
+
+    loss_val = loss.item() / dist.get_world_size() / len(dataloader)
+    acc1 = 100 * correct1.item() / total.item()
+    acc5 = 100 * correct5.item() / total.item()
+
+    return acc1, loss_val
+
+
+def validate_corruption(args, model, transform, criterion, val_ratio):
+    result = dict()
+    type_errors = []
+    for typ in CORRUPTIONS:
+        errors = []
+        for s in range(1, 6):
+            split = "c-" + typ + "-" + str(s)
+            loader = prepare_loader(args, split, transform)
+            acc, _ = validate(loader, model, criterion, val_ratio)
+            errors.append(100 - acc)
+        type_errors.append(get_mean(errors))
+    me = get_mean(type_errors)
+    relative_es = [(e / al) for (e, al) in zip(type_errors, ALEX)]
+    mce = 100 * get_mean(relative_es)
+    result["es"] = type_errors
+    result["ces"] = relative_es
+    result["me"] = me
+    result["mce"] = mce
+    if args.rank == 0:
+        print(f"mCE: {mce:.2f}%, mean_err: {me}%", flush=True)
+    return result
+
+"""def validate(model, loader, loss_fn, args, val_ratio, amp_autocast=suppress, log_suffix='', adv=False):
     batch_time_m = AverageMeter()
     losses_m = AverageMeter()
     top1_m = AverageMeter()
@@ -760,7 +885,7 @@ def validate(model, loader, loss_fn, args, val_ratio, amp_autocast=suppress, log
 
     metrics = OrderedDict([('loss', losses_m.avg), ('top1', top1_m.avg), ('top5', top5_m.avg)])
 
-    return metrics
+    return metrics"""
 
 
 if __name__ == '__main__':
@@ -780,7 +905,7 @@ if __name__ == '__main__':
     # Related to nullspace
     parser.add_argument('-db', '--debug', action='store_false')
     parser.add_argument('--lim', type=float, default=3, help='sampling limit of the noise')
-    parser.add_argument('--nlr', type=float, default=0.1, help='learning rate for the noise')
+    parser.add_argument('--nlr', type=float, default=1., help='learning rate for the noise') #0.1
     parser.add_argument('--eps', type=float, default=0.01, help='threshold to stop training the noise')
     parser.add_argument('--no-adv', action='store_true')
 
@@ -964,7 +1089,7 @@ if __name__ == '__main__':
                         help='Enable tracking moving average of model weights')
     parser.add_argument('--model-ema-force-cpu', action='store_true', default=False,
                         help='Force ema to be tracked on CPU, rank=0 node only. Disables EMA validation.')
-    parser.add_argument('--model-ema-decay', type=float, default=0.99992,
+    parser.add_argument('--model-ema-decay', type=float, default=0.9998, #0.99992,
                         help='decay factor for model weights moving average (default: 0.9998)')
 
     # Misc
@@ -972,7 +1097,7 @@ if __name__ == '__main__':
                         help='random seed (default: 42)')
     parser.add_argument('--worker-seeding', type=str, default='all',
                         help='worker seed mode (default: all)')
-    parser.add_argument('--log-interval', type=int, default=100, metavar='N',
+    parser.add_argument('--log-interval', type=int, default=500, metavar='N',
                         help='how many batches to wait before logging training status')
     parser.add_argument('--recovery-interval', type=int, default=0, metavar='N',
                         help='how many batches to wait before writing recovery checkpoint')
