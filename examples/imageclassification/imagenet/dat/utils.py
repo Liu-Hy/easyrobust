@@ -191,7 +191,7 @@ def encoder_forward(model, x):
     return mdl.pre_logits(x[:, 0])
 
 
-def encoder_level_epsilon_noise(model, loader, img_size, rounds, nlr, lim, eps, img_ratio, disable=True):
+def encoder_level_epsilon_noise(model, loader, img_size, rounds, nlr, lim, eps, img_ratio, verbose=False):
     print(f"img size {img_size}")
     model.eval()
     model.zero_grad()
@@ -220,8 +220,10 @@ def encoder_level_epsilon_noise(model, loader, img_size, rounds, nlr, lim, eps, 
     scheduler = CosineAnnealingLR(optimizer, len(loader) * rounds)
 
     for i in range(rounds):
-        iterator = tqdm(loader, position=0, disable=disable)
-        for st, (imgs, lab) in enumerate(iterator):
+        #iterator = tqdm(loader, position=0, disable=disable)
+        running_err = 0.
+        avg_err = 0.
+        for st, (imgs, lab) in enumerate(loader):
             assert delta_x.requires_grad == True
             if st > int(img_ratio * len(loader)) - 1:
                 break
@@ -247,17 +249,25 @@ def encoder_level_epsilon_noise(model, loader, img_size, rounds, nlr, lim, eps, 
                 print(f"Image finished training at epoch {i} step {st}", flush=True)
                 return delta_x
 
-            error_mult = (((preds - og_preds) ** 2).sum(dim=-1) ** 0.5).mean()
+            #error_mult = (((preds - og_preds) ** 2).sum(dim=-1) ** 0.5).mean()
+            error_mult = (((preds - og_preds) ** 2).sum(dim=-1)).mean()
             error_mult.backward()
+            running_err += error_mult.item()
             if isinstance(model, DistributedDataParallel):
                 dist.barrier()
                 dist.all_reduce(delta_x.grad)
                 delta_x.grad /= dist.get_world_size()
             optimizer.step()
             scheduler.step()
-            iterator.set_postfix({"error": round(error_mult.item(), 4)})
-        if not (i + 1) % 1:
-            print(f'Noise trained for {i + 1} epochs, error: {round(error_mult.item(), 4)}', flush=True)
+            if verbose and (st+1) % 1000 == 0:
+                avg_err = running_err / 1000
+                print(f"Noise error at step {st+1}: {round(avg_err, 4)}")
+                running_err = 0.
+            # iterator.set_postfix({"error": round(error_mult.item(), 4)})
+        if verbose:
+            print(f'Noise trained for {i + 1} epochs, error: {round(avg_err, 4)}', flush=True)
+            if i == rounds - 1:
+                print(f"Noise influence: {mse_probs.item()}")
 
     return delta_x
 
