@@ -163,12 +163,12 @@ def main(local_rank, args, args_text):
     eps = args.eps
     adv = not args.no_adv
     img_ratio = 0.1
-    train_ratio = 1.
+    train_ratio = 0.1
     val_ratio = 1.
 
     if args.debug:
-        args.batch_size = 2
-        img_ratio, train_ratio, val_ratio = 0.001, 0.001, 0.1
+        args.batch_size = 8
+        img_ratio, train_ratio, val_ratio = 0.1, 0.001, 1.
 
     args.distributed = True
     """if 'WORLD_SIZE' in os.environ:
@@ -219,6 +219,9 @@ def main(local_rank, args, args_text):
                         "Install NVIDA apex or upgrade to PyTorch 1.6")
 
     random_seed(args.seed, args.rank)
+
+    if args.rank == 0:
+        print(args)
 
     model = create_model(
         args.model,
@@ -483,10 +486,9 @@ def main(local_rank, args, args_text):
     if args.experiment:
         exp_name = args.experiment
     else:
-        exp_name = '-'.join([
+        exp_name = '-'.join([args.resume.split('/')[-1].split('.')[0],
+            'adv'+str(int(adv)), 'lim'+ str(lim), 'nlr'+str(nlr), 'eps'+str(eps), 'lr'+str(args.lr),
             # datetime.now().strftime("%Y%m%d-%H%M%S"),
-            safe_model_name(args.model),
-            str(data_config['input_size'][-1])
         ])
     output_dir = Path(os.path.join(args.output, exp_name))
     noise_path = output_dir.joinpath("noise")
@@ -531,7 +533,7 @@ def main(local_rank, args, args_text):
                 img_size = data_config["input_size"][-1]
                 assert img_size == 224
                 delta_x = encoder_level_epsilon_noise(model, loader_img, img_size, rounds, nlr, lim, eps, img_ratio,
-                                                      disable=True)
+                                                      verbose=(local_rank==0))
             if args.rank == 0:
                 torch.save({"delta_x": delta_x}, noise_path.joinpath(str(epoch)))
             if local_rank == 0:
@@ -555,7 +557,7 @@ def main(local_rank, args, args_text):
                 # step LR for next epoch
                 lr_scheduler.step(epoch + 1)
 
-            if epoch % 5 == 0:
+            if epoch % 1 == 0:
                 result, avg_result = validate_all(model_ema, args, data_config, validate_loss_fn, val_ratio, False)
                 """if output_dir is not None:
                     update_summary(
@@ -765,12 +767,12 @@ def validate_all(model_ema, args, data_config, validate_loss_fn, val_ratio, is_o
             print(f"Avg performance: {avg_result}\n", result)
     return result, avg_result
 
-def validate(dataloader, model, criterion, val_ratio, mask=None, adv='none', eps=8/225):
+def validate(dataloader, model, criterion, val_ratio, mask=None, adv='none', eps=1/255):
     loss, correct1, correct5, total = torch.zeros(4).cuda()
     model.eval()
     assert adv in ['none', 'FGSM', 'Linf', 'L2'], '{} is not supported!'.format(adv)
     if adv == "FGSM":
-        attack = torchattacks.FGSM(model, eps=8 / 225)
+        attack = torchattacks.FGSM(model, eps=8/255)
     elif adv != "none":
         attack = AutoAttack(model, norm=adv, eps=eps, version='standard', n_classes=1000)
     for step, batch in enumerate(dataloader):
@@ -904,9 +906,9 @@ if __name__ == '__main__':
 
     # Related to nullspace
     parser.add_argument('-db', '--debug', action='store_false')
-    parser.add_argument('--lim', type=float, default=3, help='sampling limit of the noise')
-    parser.add_argument('--nlr', type=float, default=1., help='learning rate for the noise') #0.1
-    parser.add_argument('--eps', type=float, default=0.01, help='threshold to stop training the noise')
+    parser.add_argument('--lim', type=float, default=1.0, help='sampling limit of the noise')
+    parser.add_argument('--nlr', type=float, default=0.1, help='learning rate for the noise') #0.1
+    parser.add_argument('--eps', type=float, default=0.03, help='threshold to stop training the noise')
     parser.add_argument('--no-adv', action='store_true')
 
     # Dataset / Model parameters
@@ -973,7 +975,7 @@ if __name__ == '__main__':
     # Learning rate schedule parameters
     parser.add_argument('--sched', default='cosine', type=str, metavar='SCHEDULER',
                         help='LR scheduler (default: "step"')
-    parser.add_argument('--lr', type=float, default=1e-5, metavar='LR',
+    parser.add_argument('--lr', type=float, default=2e-5, metavar='LR',
                         help='learning rate (default: 0.05)')
     parser.add_argument('--lr-noise', type=float, nargs='+', default=None, metavar='pct, pct',
                         help='learning rate noise on/off epoch percentages')
@@ -1089,7 +1091,7 @@ if __name__ == '__main__':
                         help='Enable tracking moving average of model weights')
     parser.add_argument('--model-ema-force-cpu', action='store_true', default=False,
                         help='Force ema to be tracked on CPU, rank=0 node only. Disables EMA validation.')
-    parser.add_argument('--model-ema-decay', type=float, default=0.9998, #0.99992,
+    parser.add_argument('--model-ema-decay', type=float, default=0.99992, #0.99992,
                         help='decay factor for model weights moving average (default: 0.9998)')
 
     # Misc
