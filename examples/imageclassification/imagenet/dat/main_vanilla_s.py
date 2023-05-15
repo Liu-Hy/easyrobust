@@ -477,7 +477,7 @@ def main(local_rank, args, args_text):
     if args.experiment:
         exp_name = args.experiment
     else:
-        exp_name = '-'.join([args.resume.split('/')[-1].split('.')[0], 's',
+        exp_name = '-'.join([args.resume.split('/')[-1].split('.')[0], 'vs',
             'adv'+str(int(adv)), 'lim'+ str(lim), 'nlr'+str(nlr), 'eps'+str(eps), 'lr'+str(args.lr),
             # datetime.now().strftime("%Y%m%d-%H%M%S"),
         ])
@@ -547,7 +547,7 @@ def main(local_rank, args, args_text):
                 # step LR for next epoch
                 lr_scheduler.step(epoch + 1)
 
-            if epoch % 4 == 0:
+            if (epoch + 1) % 3 == 0:
                 result, avg_result = validate_all(model, args, data_config, validate_loss_fn, val_ratio, False)
                 """if output_dir is not None:
                     update_summary(
@@ -706,30 +706,15 @@ def validate_all(model, args, data_config, validate_loss_fn, val_ratio, is_origi
     result = dict()
     # Evaluate on val and OOD datasets except imagenet-c
     for split in SPLITS:
-        if not split.startswith("c-"):
-            # Use a logits mask to evaluate on 200-class validation sets
-            if split == "adversarial":
-                mask = imagenet_a_mask
-            elif split == "rendition":
-                mask = imagenet_r_mask
-            else:
-                mask = None
+        if split == "val":
+            mask = None
             val_transform = get_val_transform(data_config, split)
-            if split == "val":
-                dts = hfai.datasets.ImageNet('val', transform=val_transform)
-                loader_eval = prepare_loader(args, dts)
-            else:
-                loader_eval = prepare_loader(args, split, val_transform)
+            dts = hfai.datasets.ImageNet('val', transform=val_transform)
+            loader_eval = prepare_loader(args, dts)
             acc = validate(loader_eval, model, validate_loss_fn, val_ratio, mask=mask)[0]
-
             result[split] = acc
             # Evaluate adversarial robustness on the validation set.
-            if split == "val":
-                result["fgsm"] = validate(loader_eval, model, validate_loss_fn, val_ratio, adv="FGSM")[0]
-    # Evaluate on imagenet-c
-    c_transform = get_val_transform(data_config, "corruption")
-    corruption_rs = validate_corruption(args, model, c_transform, validate_loss_fn, 0.1)
-    result["corruption"] = corruption_rs["mce"]
+            result["fgsm"] = validate(loader_eval, model, validate_loss_fn, val_ratio, adv="FGSM")[0]
     avg_result = get_mean([100 - v if k == "corruption" else v for k, v in result.items()])
     if args.rank == 0:
         if is_origin:
