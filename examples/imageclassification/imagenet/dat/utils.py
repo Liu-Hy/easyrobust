@@ -130,6 +130,8 @@ def load_state_dict(checkpoint_path, use_ema=False):
                 state_dict_key = 'state_dict'
             elif 'model' in checkpoint:
                 state_dict_key = 'model'
+            elif 'model_state_dict' in checkpoint:
+                state_dict_key = 'model_state_dict'
         if state_dict_key:
             state_dict = checkpoint[state_dict_key]
             new_state_dict = OrderedDict()
@@ -177,15 +179,15 @@ def get_model_and_config(model_name, ckpt_path=None, use_ema=False):
         load_checkpoint(model, ckpt_path, use_ema=use_ema, strict=True)
 
     config = resolve_data_config({}, model=model)
-    # Of all ViT models concerned in this work, DAT is the only version that uses mean and std different from default_cfg of the timm model
-    if ckpt_path is not None and "dat" in ckpt_path.lower():
-        config["mean"] = [0.485, 0.456, 0.406]
-        config["std"] = [0.229, 0.224, 0.225]
+    # Prohibit normalization at the preprocessing stage. Norm layer should be put into model for adversarial attack evaluation.
+    config["mean"] = [0., 0., 0.]
+    config["std"] = [1., 1., 1.]
     print(config)
     try:
         patch_size = model.patch_embed.patch_size[0]
         img_size = model.patch_embed.img_size[0]
     except:
+        print("Please check the patch size carefully")
         patch_size = 32
         img_size = 224
     print(f'{model_name}, {img_size}x{img_size}, patch_size:{patch_size}')
