@@ -315,8 +315,8 @@ def encoder_level_epsilon_noise(model, loader, img_size, rounds, nlr, lim, eps, 
                 delta_x.grad /= dist.get_world_size()
             optimizer.step()
             scheduler.step()
-            if verbose and (st+1) % 1000 == 0:
-                avg_err = running_err / 1000
+            if verbose and (st+1) % 10 == 0:
+                avg_err = running_err / 10 #1000
                 print(f"Noise error at step {st+1}: {round(avg_err, 4)}")
                 running_err = 0.
             # iterator.set_postfix({"error": round(error_mult.item(), 4)})
