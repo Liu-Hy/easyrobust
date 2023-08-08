@@ -17,6 +17,7 @@ from timm.utils import ModelEmaV2, distribute_bn
 from utils import *
 from tqdm import tqdm
 from torch.utils.data import DataLoader
+import torch.nn.functional as F
 
 def normalize_fn(tensor, mean, std):
     """Differentiable version of torchvision.functional.normalize"""
@@ -46,6 +47,9 @@ def adv_train(dataloader, model, criterion, optimizer, scheduler, args, delta_x,
     model.train()
     if args.adv == 'madry':
         attack = torchattacks.PGD(model, eps=8 / 255, alpha=2 / 255, steps=10, random_start=True)
+    elif args.adv == 'trades':
+        attack = torchattacks.TPGD(model, eps=8/255, alpha=2/255, steps=10)
+        criterion_kl = nn.KLDivLoss(size_average=False)
     for step, batch in enumerate(dataloader):
         if step > int(train_ratio * len(dataloader)):
             break
@@ -58,7 +62,13 @@ def adv_train(dataloader, model, criterion, optimizer, scheduler, args, delta_x,
             adv_imgs = attack(imgs, labels)
             adv_outputs = model(adv_imgs)
             adv_loss = criterion(adv_outputs, labels)
-            loss = loss + adv_loss
+            loss = loss + args.beta * adv_loss
+        elif args.adv == 'trades':
+            adv_imgs = attack(imgs, labels)
+            adv_outputs = model(adv_imgs)
+            adv_loss = (1.0 / args.batch_size) * criterion_kl(F.log_softmax(adv_outputs, dim=1),
+                                                            F.softmax(outputs, dim=1))
+            loss = loss + args.beta * adv_loss
         if args.ns:
             x = model.module[1].patch_embed(model.module[0](imgs))
             x = x + delta_x.cuda(non_blocking=True)
@@ -147,6 +157,8 @@ def main(args):
     lim = args.lim
     nlr = args.nlr
     eps = args.eps
+    if args.ns_mode != 'default':
+        assert args.ns is True, 'When nullspace mode is set, nullspace training must be turned on'
     img_ratio = 0.1  # 0.02
     train_ratio = 0.004  # 0.1
     val_ratio = 1.  # 0.05
@@ -176,7 +188,7 @@ def main(args):
         load_checkpoint(model_ema.module.module, ckpt_path, use_ema=True)
 
     m = model_name.split('_')[1]
-    setting = f'{m}_ps{patch_size}_epochs{epochs}_lr{lr}_bs{train_batch_size}_ns_{args.ns}_adv_{args.adv}_nlr{nlr}_rounds{rounds}' + \
+    setting = f'{m}_ps{patch_size}_epochs{epochs}_lr{lr}_bs{train_batch_size}_ns_{args.ns}_mode_{args.ns_mode}_adv_{args.adv}_nlr{nlr}_rounds{rounds}' + \
               f'_lim{lim}_eps{eps}_imgr{img_ratio}_trainr{train_ratio}_valr{val_ratio}'
     setting_path = save_path.joinpath(setting)
     noise_path = setting_path.joinpath("noise")
@@ -237,7 +249,7 @@ def main(args):
                 delta_x = torch.load(noise_path.joinpath(str(epoch)))['delta_x']
             else:
                 print("---- Learning noise")
-                delta_x = encoder_level_epsilon_noise(model, img_loader, img_size, rounds, nlr, lim, eps, img_ratio)
+                delta_x = encoder_level_epsilon_noise(model, img_loader, img_size, rounds, nlr, lim, eps, img_ratio, ns_mode=args.ns_mode)
                 torch.save({"delta_x": delta_x}, noise_path.joinpath(str(epoch)))
             print(f"Noise norm: {round(torch.norm(delta_x).item(), 4)}")
 
@@ -277,6 +289,8 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('-db', '--debug', action='store_true')
     parser.add_argument('--ns', action='store_true')
+    parser.add_argument('--ns-mode', choices=['default', 'random'],
+                        default='default', help='Options for nullspace noise generation')
     parser.add_argument('--use-ema', action='store_true',
                         help='Enable tracking moving average of model weights')
     parser.add_argument('--adv', choices=['trades', 'madry', 'none'],
@@ -298,6 +312,7 @@ if __name__ == '__main__':
     parser.add_argument('--nlr', type=float, default=0.1, help='learning rate for the noise')
     parser.add_argument('--eps', type=float, default=0.03, help='threshold to stop training the noise')
     parser.add_argument('--epochs', type=int, default=20, help='number of epochs to train')
+    parser.add_argument('--beta', type=float, default=1.0, help='coefficient for adversarial training')
     #parser.add_argument('--no-adv', action='store_true')
 
 
