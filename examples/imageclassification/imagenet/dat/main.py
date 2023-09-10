@@ -34,7 +34,7 @@ from torchvision import transforms
 from torch.nn.parallel import DistributedDataParallel as NativeDDP
 
 from timm.data import resolve_data_config, Mixup
-from timm.models import create_model, safe_model_name, resume_checkpoint, load_checkpoint, \
+from timm.models import create_model, safe_model_name, load_checkpoint, \
     convert_splitbn_model, model_parameters
 from timm.utils import *
 from timm.loss import *
@@ -44,7 +44,7 @@ from timm.utils import ApexScaler, NativeScaler
 from timm.data import create_transform
 from timm.data.distributed_sampler import OrderedDistributedSampler
 
-from utils import encoder_forward, encoder_level_epsilon_noise, get_mean
+from utils import encoder_forward, encoder_level_epsilon_noise, get_mean, resume_checkpoint
 from constants import *
 from ImageNetDG import ImageNetDG
 from vqgan import VQModel, reconstruct_with_vqgan
@@ -161,14 +161,13 @@ def main(local_rank, args, args_text):
     lim = args.lim
     nlr = args.nlr
     eps = args.eps
-    adv = not args.no_adv
     img_ratio = 0.1
-    train_ratio = 0.1
+    train_ratio = 0.004
     val_ratio = 1.
 
     if args.debug:
-        args.batch_size = 8
-        img_ratio, train_ratio, val_ratio = 0.1, 0.001, 1.
+        args.batch_size = 2
+        img_ratio, train_ratio, val_ratio = 0.01, 0.001, 0.01
 
     args.distributed = True
     """if 'WORLD_SIZE' in os.environ:
@@ -304,14 +303,14 @@ def main(local_rank, args, args_text):
     resume_epoch = None
     if args.resume:
         resume_epoch = resume_checkpoint(
-            model, args.resume,
+            model[1], args.resume,
             optimizer=None if not args.resume_opt else optimizer,
             loss_scaler=None if not args.resume_opt else loss_scaler,
             log_info=args.local_rank == 0)
 
     # setup exponential moving average of model weights, SWA could be used here too
     model_ema = None
-    if args.model_ema:
+    if args.use_ema:
         # Important to create EMA model after cuda(), DP wrapper, and AMP but before SyncBN and DDP wrapper
         model_ema = ModelEmaV2(
             model, decay=args.model_ema_decay, device='cpu' if args.model_ema_force_cpu else None)
@@ -333,14 +332,6 @@ def main(local_rank, args, args_text):
 
     # setup learning rate schedule and starting epoch
     lr_scheduler, num_epochs = create_scheduler(args, optimizer)
-    start_epoch = 0
-    """if args.start_epoch is not None:
-        # a specified start_epoch will always override the resume epoch
-        start_epoch = args.start_epoch
-    elif resume_epoch is not None:
-        start_epoch = resume_epoch
-    if lr_scheduler is not None and start_epoch > 0:
-        lr_scheduler.step(start_epoch)"""
 
     if args.local_rank == 0:
         _logger.info('Scheduled epochs: {}'.format(num_epochs))
@@ -392,32 +383,6 @@ def main(local_rank, args, args_text):
         re_num_splits=re_num_splits,
         separate=num_aug_splits > 0,
     )
-    """val_transform = create_transform(  # 可能要改
-        input_size=data_config['input_size'],
-        is_training=False,
-        use_prefetcher=False,
-        no_aug=False,
-        scale=None,
-        ratio=False,
-        hflip=0.5,
-        vflip=0.,
-        color_jitter=0.4,
-        auto_augment=None,
-        interpolation=data_config['interpolation'],
-        mean=data_config['mean'],
-        std=data_config['std'],
-        crop_pct=data_config['crop_pct'],
-        tf_preprocessing=False,
-        re_prob=0.,
-        re_mode='const',
-        re_count=1,
-        re_num_splits=re_num_splits,
-        separate=num_aug_splits > 0,
-    )"""
-
-    # print(train_transform)
-    # print(val_transform)
-
 
     # create the train and eval datasets
     dataset_train = hfai.datasets.ImageNet('train', transform=train_transform)
@@ -436,16 +401,6 @@ def main(local_rank, args, args_text):
         drop_last=True, 
         persistent_workers=False
     )
-
-    """loader_eval = DataLoader(
-        dataset_eval,
-        sampler=eval_sampler,
-        batch_size=int(1.5 * args.batch_size),
-        num_workers=args.workers,
-        pin_memory=args.pin_mem,
-        drop_last=False, 
-        persistent_workers=False
-    )"""
 
     loader_img = DataLoader(
         dataset_train,
@@ -486,8 +441,8 @@ def main(local_rank, args, args_text):
     if args.experiment:
         exp_name = args.experiment
     else:
-        exp_name = '-'.join([args.resume.split('/')[-1].split('.')[0],
-            'adv'+str(int(adv)), 'lim'+ str(lim), 'nlr'+str(nlr), 'eps'+str(eps), 'lr'+str(args.lr),
+        exp_name = '-'.join([args.resume.split('/')[-1].split('.')[0], 'dat'+str(args.dat),
+            'ns'+str(args.ns), 'lim'+ str(lim), 'nlr'+str(nlr), 'eps'+str(eps), 'lr'+str(args.lr),
             # datetime.now().strftime("%Y%m%d-%H%M%S"),
         ])
     output_dir = Path(os.path.join(args.output, exp_name))
@@ -514,10 +469,12 @@ def main(local_rank, args, args_text):
     best_metric, delta_x, state_dict_ema = None, None, None
     if others is not None:
         best_metric, delta_x, state_dict_ema = others
-        model_ema.module.load_state_dict(state_dict_ema)
+        if args.use_ema:
+            model_ema.module.load_state_dict(state_dict_ema)
 
+    model_to_validate = model_ema if model_ema is not None else model
     if (start_epoch == 0) and (start_step == 0):
-        result, avg_result = validate_all(model_ema, args, data_config, validate_loss_fn, val_ratio, True)
+        result, avg_result = validate_all(model_to_validate, args, data_config, validate_loss_fn, val_ratio, True)
         best_metric = avg_result
 
     try:
@@ -527,7 +484,7 @@ def main(local_rank, args, args_text):
 
             loader_train.set_step(start_step)
 
-            if delta_x is None:
+            if delta_x is None and args.ns:
                 if local_rank == 0:
                     print("---- Learning noise")
                 img_size = data_config["input_size"][-1]
@@ -540,7 +497,7 @@ def main(local_rank, args, args_text):
                 print(f"Noise norm: {round(torch.norm(delta_x).item(), 4)}")
 
             train_metrics = train_one_epoch(
-                epoch, model, loader_train, optimizer, train_loss_fn, args, best_metric, start_step, adv, delta_x, train_ratio,
+                epoch, model, loader_train, optimizer, train_loss_fn, args, best_metric, start_step, delta_x, train_ratio,
                 lr_scheduler=lr_scheduler, saver=saver, output_dir=output_dir,
                 amp_autocast=amp_autocast, loss_scaler=loss_scaler, model_ema=model_ema, mixup_fn=mixup_fn)
 
@@ -558,17 +515,13 @@ def main(local_rank, args, args_text):
                 lr_scheduler.step(epoch + 1)
 
             if epoch % 1 == 0:
-                result, avg_result = validate_all(model_ema, args, data_config, validate_loss_fn, val_ratio, False)
-                """if output_dir is not None:
-                    update_summary(
-                        epoch, train_metrics, result, os.path.join(output_dir, 'summary.csv'),
-                        write_header=best_metric is None, log_wandb=args.log_wandb and has_wandb)"""
-
+                result, avg_result = validate_all(model_to_validate, args, data_config, validate_loss_fn, val_ratio, False)
+                ema_to_save = None if model_ema is None else model_ema.module.state_dict()
                 if local_rank == 0:
                     try:
                         torch.save({"model_name": safe_model_name(args.model), "epoch": epoch,
                                     "model_state_dict": model.module.state_dict(),
-                                    "state_dict_ema": model_ema.module.state_dict(),
+                                    "state_dict_ema": ema_to_save,
                                     "optimizer_state_dict": optimizer.state_dict(),
                                     "result": result}, model_path.joinpath(str(epoch)))
                     except FileExistsError:
@@ -582,7 +535,7 @@ def main(local_rank, args, args_text):
                         try:
                             torch.save(
                                 {"model_state_dict": model.module.state_dict(),
-                                 "state_dict_ema": model_ema.module.state_dict(),
+                                 "state_dict_ema": ema_to_save,
                                  "best_epoch": epoch, "best_acc": best_metric}, output_dir.joinpath("best_epoch"))
                         except FileExistsError:
                             print("File exists")
@@ -594,7 +547,7 @@ def main(local_rank, args, args_text):
 
 
 def train_one_epoch(
-        epoch, model, loader, optimizer, loss_fn, args, best_acc, start_step, adv, delta_x, train_ratio,
+        epoch, model, loader, optimizer, loss_fn, args, best_acc, start_step, delta_x, train_ratio,
         lr_scheduler=None, saver=None, output_dir=None, amp_autocast=suppress,
         loss_scaler=None, model_ema=None, mixup_fn=None):
 
@@ -609,10 +562,11 @@ def train_one_epoch(
 
     model.train()
 
-    ddconfig = {'double_z': False, 'z_channels': 4, 'resolution': 256, 'in_channels': 3, 'out_ch': 3, 'ch': 128, 'ch_mult': [1,2,2,4], 'num_res_blocks': 2, 'attn_resolutions':[32], 'dropout': 0.0}
-    vqgan_aug = VQModel(ddconfig, n_embed=16384, embed_dim=4, ckpt_path='../../../../pretrained/vqgan_openimages_f8_16384.ckpt')
-    vqgan_aug = vqgan_aug.cuda()
-    vqgan_aug.eval()
+    if args.dat:
+        ddconfig = {'double_z': False, 'z_channels': 4, 'resolution': 256, 'in_channels': 3, 'out_ch': 3, 'ch': 128, 'ch_mult': [1,2,2,4], 'num_res_blocks': 2, 'attn_resolutions':[32], 'dropout': 0.0}
+        vqgan_aug = VQModel(ddconfig, n_embed=16384, embed_dim=4, ckpt_path='../../../../pretrained/vqgan_openimages_f8_16384.ckpt')
+        vqgan_aug = vqgan_aug.cuda()
+        vqgan_aug.eval()
 
     end = time.time()
     last_idx = len(loader) - 1
@@ -635,26 +589,27 @@ def train_one_epoch(
             output = model(input)
             loss = loss_fn(output, target)
 
-        with torch.no_grad():
-            xrec = reconstruct_with_vqgan(input, vqgan_aug)
+        if args.dat:
+            with torch.no_grad():
+                xrec = reconstruct_with_vqgan(input, vqgan_aug)
 
-        adv_input = pgd_generator(xrec, target, model, attack_type='L2', eps=0.1, attack_steps=1, attack_lr=0.1, random_start_prob=0.8, use_best=False, attack_criterion='mixup', eval_mode=False)
+            adv_input = pgd_generator(xrec, target, model, attack_type='L2', eps=0.1, attack_steps=1, attack_lr=0.1, random_start_prob=0.8, use_best=False, attack_criterion='mixup', eval_mode=False)
 
-        with torch.no_grad():
-            adv_xrec = reconstruct_with_vqgan(adv_input, vqgan_aug)
+            with torch.no_grad():
+                adv_xrec = reconstruct_with_vqgan(adv_input, vqgan_aug)
 
-        with amp_autocast():
-            output2 = model(adv_xrec)
-            loss += loss_fn(output2, target)
+            with amp_autocast():
+                output2 = model(adv_xrec)
+                loss += loss_fn(output2, target)
 
-        if adv:
-            x = model.module[1].patch_embed(input)
+        if args.ns:
+            x = model.module[1].patch_embed(model.module[0](input))
             x = x + delta_x.cuda(non_blocking=True)
-            adv_outputs = model.module[1].head(encoder_forward(model, x))
-            adv_loss = loss_fn(adv_outputs, target)
-            # adv_loss.backward()
-            consistency = ((adv_outputs - output) ** 2).sum(dim=-1).mean()
-            loss = loss + adv_loss
+            ns_outputs = model.module[1].head(encoder_forward(model, x))
+            ns_loss = loss_fn(ns_outputs, target)
+            # ns_loss.backward()
+            # consistency = ((ns_outputs - output) ** 2).sum(dim=-1).mean()
+            loss = loss + ns_loss
 
         if not args.distributed:
             losses_m.update(loss.item(), input.size(0))
@@ -714,7 +669,8 @@ def train_one_epoch(
                         normalize=True)
 
         if batch_idx % 100 == 0:
-            model.try_save(epoch, batch_idx + 1, others=(best_acc, delta_x, model_ema.module.state_dict()), force=True)
+            ema_to_save = None if model_ema is None else model_ema.module.state_dict()
+            model.try_save(epoch, batch_idx + 1, others=(best_acc, delta_x, ema_to_save), force=True)
 
         if lr_scheduler is not None:
             lr_scheduler.step_update(num_updates=num_updates, metric=losses_m.avg)
@@ -727,10 +683,13 @@ def train_one_epoch(
 
     return OrderedDict([('loss', losses_m.avg)])
 
-def validate_all(model_ema, args, data_config, validate_loss_fn, val_ratio, is_origin):
-    assert (model_ema is not None) and (not args.model_ema_force_cpu)
+def validate_all(model, args, data_config, validate_loss_fn, val_ratio, is_origin):
+    assert model is not None
+    if args.use_ema:
+        assert not args.model_ema_force_cpu
+    model_to_val = model.module if args.use_ema else model
     if args.distributed and args.dist_bn in ('broadcast', 'reduce') and not is_origin:
-        distribute_bn(model_ema, args.world_size, args.dist_bn == 'reduce')
+        distribute_bn(model, args.world_size, args.dist_bn == 'reduce')
 
     result = dict()
     # Evaluate on val and OOD datasets except imagenet-c
@@ -749,15 +708,15 @@ def validate_all(model_ema, args, data_config, validate_loss_fn, val_ratio, is_o
                 loader_eval = prepare_loader(args, dts)
             else:
                 loader_eval = prepare_loader(args, split, val_transform)
-            acc = validate(loader_eval, model_ema.module, validate_loss_fn, val_ratio, mask=mask)[0]
+            acc = validate(loader_eval, model_to_val, validate_loss_fn, val_ratio, mask=mask)[0]
 
             result[split] = acc
             # Evaluate adversarial robustness on the validation set.
             if split == "val":
-                result["fgsm"] = validate(loader_eval, model_ema.module, validate_loss_fn, val_ratio, adv="FGSM")[0]
+                result["fgsm"] = validate(loader_eval, model_to_val, validate_loss_fn, val_ratio, adv="FGSM")[0]
     # Evaluate on imagenet-c
     c_transform = get_val_transform(data_config, "corruption")
-    corruption_rs = validate_corruption(args, model_ema.module, c_transform, validate_loss_fn, 0.1)
+    corruption_rs = validate_corruption(args, model_to_val, c_transform, validate_loss_fn, 0.1)
     result["corruption"] = corruption_rs["mce"]
     avg_result = get_mean([100 - v if k == "corruption" else v for k, v in result.items()])
     if args.rank == 0:
@@ -772,7 +731,7 @@ def validate(dataloader, model, criterion, val_ratio, mask=None, adv='none', eps
     model.eval()
     assert adv in ['none', 'FGSM', 'Linf', 'L2'], '{} is not supported!'.format(adv)
     if adv == "FGSM":
-        attack = torchattacks.FGSM(model, eps=8/255)
+        attack = torchattacks.FGSM(model, eps=1/255)
     elif adv != "none":
         attack = AutoAttack(model, norm=adv, eps=eps, version='standard', n_classes=1000)
     for step, batch in enumerate(dataloader):
@@ -823,72 +782,6 @@ def validate_corruption(args, model, transform, criterion, val_ratio):
         print(f"mCE: {mce:.2f}%, mean_err: {me}%", flush=True)
     return result
 
-"""def validate(model, loader, loss_fn, args, val_ratio, amp_autocast=suppress, log_suffix='', adv=False):
-    batch_time_m = AverageMeter()
-    losses_m = AverageMeter()
-    top1_m = AverageMeter()
-    top5_m = AverageMeter()
-
-    model.eval()
-    if adv:
-        attack = torchattacks.FGSM(model, eps=8 / 225)
-    end = time.time()
-    last_idx = len(loader) - 1
-    with torch.no_grad():
-        for batch_idx, (input, target) in enumerate(loader):
-            if batch_idx > int(val_ratio * len(loader)):
-                break
-            last_batch = batch_idx == last_idx
-            input = input.cuda()
-            target = target.cuda()
-            if args.channels_last:
-                input = input.contiguous(memory_format=torch.channels_last)
-            if adv:
-                input = attack(input, target)
-            with amp_autocast():
-                output = model(input)
-            if isinstance(output, (tuple, list)):
-                output = output[0]
-
-            # augmentation reduction
-            reduce_factor = args.tta
-            if reduce_factor > 1:
-                output = output.unfold(0, reduce_factor, reduce_factor).mean(dim=2)
-                target = target[0:target.size(0):reduce_factor]
-
-            loss = loss_fn(output, target)
-            acc1, acc5 = accuracy(output, target, topk=(1, 5))
-
-            if args.distributed:
-                reduced_loss = reduce_tensor(loss.data, args.world_size)
-                acc1 = reduce_tensor(acc1, args.world_size)
-                acc5 = reduce_tensor(acc5, args.world_size)
-            else:
-                reduced_loss = loss.data
-
-            torch.cuda.synchronize()
-
-            losses_m.update(reduced_loss.item(), input.size(0))
-            top1_m.update(acc1.item(), output.size(0))
-            top5_m.update(acc5.item(), output.size(0))
-
-            batch_time_m.update(time.time() - end)
-            end = time.time()
-            if args.local_rank == 0 and (last_batch or batch_idx % args.log_interval == 0):
-                log_name = 'Test' + log_suffix
-                _logger.info(
-                    '{0}: [{1:>4d}/{2}]  '
-                    'Time: {batch_time.val:.3f} ({batch_time.avg:.3f})  '
-                    'Loss: {loss.val:>7.4f} ({loss.avg:>6.4f})  '
-                    'Acc@1: {top1.val:>7.4f} ({top1.avg:>7.4f})  '
-                    'Acc@5: {top5.val:>7.4f} ({top5.avg:>7.4f})'.format(
-                        log_name, batch_idx, last_idx, batch_time=batch_time_m,
-                        loss=losses_m, top1=top1_m, top5=top5_m))
-
-    metrics = OrderedDict([('loss', losses_m.avg), ('top1', top1_m.avg), ('top5', top5_m.avg)])
-
-    return metrics"""
-
 
 if __name__ == '__main__':
 
@@ -905,11 +798,12 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='PyTorch ImageNet Training')
 
     # Related to nullspace
-    parser.add_argument('-db', '--debug', action='store_false')
-    parser.add_argument('--lim', type=float, default=1.0, help='sampling limit of the noise')
+    parser.add_argument('-db', '--debug', action='store_true')
+    parser.add_argument('--lim', type=float, default=3.0, help='sampling limit of the noise')
     parser.add_argument('--nlr', type=float, default=0.1, help='learning rate for the noise') #0.1
     parser.add_argument('--eps', type=float, default=0.03, help='threshold to stop training the noise')
-    parser.add_argument('--no-adv', action='store_true')
+    parser.add_argument('--ns', action='store_true')
+    parser.add_argument('--dat', action='store_true')
 
     # Dataset / Model parameters
     parser.add_argument('--data_dir', metavar='DIR', default='',
@@ -949,7 +843,7 @@ if __name__ == '__main__':
                         help='Override std deviation of of dataset')
     parser.add_argument('--interpolation', default='', type=str, metavar='NAME',
                         help='Image resize interpolation type (overrides model)')
-    parser.add_argument('-b', '--batch-size', type=int, default=32, metavar='N',
+    parser.add_argument('-b', '--batch-size', type=int, default=8, metavar='N',
                         help='input batch size for training (default: 128)')
     parser.add_argument('-vb', '--validation-batch-size', type=int, default=None, metavar='N',
                         help='validation batch size override (default: None)')
@@ -975,7 +869,7 @@ if __name__ == '__main__':
     # Learning rate schedule parameters
     parser.add_argument('--sched', default='cosine', type=str, metavar='SCHEDULER',
                         help='LR scheduler (default: "step"')
-    parser.add_argument('--lr', type=float, default=2e-5, metavar='LR',
+    parser.add_argument('--lr', type=float, default=1e-5, metavar='LR',
                         help='learning rate (default: 0.05)')
     parser.add_argument('--lr-noise', type=float, nargs='+', default=None, metavar='pct, pct',
                         help='learning rate noise on/off epoch percentages')
@@ -995,7 +889,7 @@ if __name__ == '__main__':
                         help='warmup learning rate (default: 0.0001)')
     parser.add_argument('--min-lr', type=float, default=1e-6, metavar='LR',
                         help='lower lr bound for cyclic schedulers that hit 0 (1e-5)')
-    parser.add_argument('--epochs', type=int, default=30, metavar='N',
+    parser.add_argument('--epochs', type=int, default=20, metavar='N',
                         help='number of epochs to train (default: 300)')
     parser.add_argument('--start-epoch', default=None, type=int, metavar='N',
                         help='manual epoch number (useful on restarts)')
@@ -1005,7 +899,7 @@ if __name__ == '__main__':
                         help='epoch interval to decay LR')
     parser.add_argument('--warmup-epochs', type=int, default=0, metavar='N',
                         help='epochs to warmup LR, if scheduler supports')
-    parser.add_argument('--cooldown-epochs', type=int, default=10, metavar='N',
+    parser.add_argument('--cooldown-epochs', type=int, default=0, metavar='N',
                         help='epochs to cooldown LR at min_lr, after cyclic schedule ends')
     parser.add_argument('--patience-epochs', type=int, default=10, metavar='N',
                         help='patience epochs for Plateau LR scheduler (default: 10')
@@ -1087,11 +981,11 @@ if __name__ == '__main__':
                         help='Enable separate BN layers per augmentation split.')
 
     # Model Exponential Moving Average
-    parser.add_argument('--model-ema', action='store_false', default=True,
+    parser.add_argument('--use-ema', action='store_true', default=False,
                         help='Enable tracking moving average of model weights')
     parser.add_argument('--model-ema-force-cpu', action='store_true', default=False,
                         help='Force ema to be tracked on CPU, rank=0 node only. Disables EMA validation.')
-    parser.add_argument('--model-ema-decay', type=float, default=0.99992, #0.99992,
+    parser.add_argument('--model-ema-decay', type=float, default=0.9998, #0.99992,
                         help='decay factor for model weights moving average (default: 0.9998)')
 
     # Misc

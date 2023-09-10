@@ -172,7 +172,8 @@ def main(args):
 
     # 模型、数据、优化器
     model_name = args.model
-    ckpt_path = args.resume
+    #ckpt_path = args.resume
+    ckpt_path = './best_epoch'
     model, patch_size, img_size, model_config = get_model_and_config(model_name, ckpt_path=ckpt_path, use_ema=False)
 
     normalize = NormalizeByChannelMeanStd(
@@ -241,6 +242,16 @@ def main(args):
         best_acc = torch.load(setting_path.joinpath("best_epoch"))["best_acc"]
         print(f"Previous best acc: {best_acc}")
 
+    model_to_validate = model_ema.module if args.use_ema else model
+    result = dict()
+    val_acc, _ = validate(val_loader, model_to_validate, criterion, val_ratio)
+    result["val"] = val_acc
+    print(result)
+    val_acc, _ = validate(val_loader, model_to_validate, criterion, val_ratio, adv=True)
+    result["fgsm"] = val_acc
+    total = get_mean([100 - v if k == "corruption" else v for k, v in result.items()])
+    print(f"Avg performance: {total}\n", result)
+
     delta_x = None
     for epoch in range(start_epoch, epochs):
         if args.ns:
@@ -255,9 +266,9 @@ def main(args):
 
         print("---- Training model")
         adv_train(train_loader, model, criterion, optimizer, scheduler, args, delta_x, train_ratio, epoch, model_ema)
+
         if (epoch+1) % 4 == 0:
             print("---- Validating model")
-            model_to_validate = model_ema.module if args.use_ema else model
             ema_to_save = model_ema.module.module.state_dict() if args.use_ema else None
             result = dict()
             # Evaluate on held-out set

@@ -114,8 +114,10 @@ def init_dataset(args, model_config):
 
 
 def get_mean(l):
-    return sum(l) / len(l)
-
+    if len(l) > 0:
+        return sum(l) / len(l)
+    else:
+        return 0.
 
 def load_state_dict(checkpoint_path, use_ema=False):
     if checkpoint_path and os.path.isfile(checkpoint_path):
@@ -236,7 +238,7 @@ def encoder_forward(model, x):
     return mdl.pre_logits(x[:, 0])
 
 
-def encoder_level_epsilon_noise(model, loader, img_size, rounds, nlr, lim, eps, img_ratio, verbose=False):
+def encoder_level_epsilon_noise(model, loader, img_size, rounds, nlr, lim, eps, img_ratio, ns_mode='none', verbose=False):
     print(f"img size {img_size}")
     model.eval()
     model.zero_grad()
@@ -256,22 +258,28 @@ def encoder_level_epsilon_noise(model, loader, img_size, rounds, nlr, lim, eps, 
         _ = patch_embed(torch.rand(1, 3, img_size, img_size).cuda(non_blocking=True))
         del_x_shape = _.shape
 
-    delta_x = torch.empty(del_x_shape).uniform_(-lim, lim).type(torch.FloatTensor).cuda(non_blocking=True)
+    if ns_mode == 'random':
+        # delta_x = torch.randn(del_x_shape, dtype=torch.FloatTensor).cuda(non_blocking=True)
+        delta_x = torch.empty(del_x_shape).normal_(mean=0, std=1.0).type(torch.FloatTensor).cuda(non_blocking=True)
+        # std=1.0
+        # return delta_x
+    else:
+        delta_x = torch.empty(del_x_shape).uniform_(-lim, lim).type(torch.FloatTensor).cuda(non_blocking=True)
     if isinstance(model, DistributedDataParallel):
         dist.broadcast(delta_x, 0)
         # dist.barrier()
-    delta_x.requires_grad = True
     print(f"Noise norm: {round(torch.norm(delta_x).item(), 4)}", flush=True)
-
-    optimizer = AdamW([delta_x], lr=nlr)
-    scheduler = CosineAnnealingLR(optimizer, len(loader) * rounds)
+    if ns_mode != 'random':
+        delta_x.requires_grad = True
+        optimizer = AdamW([delta_x], lr=nlr)
+        scheduler = CosineAnnealingLR(optimizer, len(loader) * rounds)
 
     for i in range(rounds):
         #iterator = tqdm(loader, position=0, disable=disable)
         running_err = 0.
         avg_err = 0.
         for st, (imgs, lab) in enumerate(loader):
-            assert delta_x.requires_grad == True
+            assert delta_x.requires_grad == True or ns_mode == "random"
             if st > int(img_ratio * len(loader)) - 1:
                 break
             imgs = imgs.cuda(non_blocking=True)
@@ -281,8 +289,8 @@ def encoder_level_epsilon_noise(model, loader, img_size, rounds, nlr, lim, eps, 
                     og_preds = mdl[1].head(mdl[1].forward_features(mdl[0](imgs)))
                 else:
                     og_preds = mdl.head(mdl.forward_features(imgs))
-
-            optimizer.zero_grad()
+            if ns_mode != "random":
+                optimizer.zero_grad()
 
             if isinstance(mdl, nn.Sequential):
                 x = patch_embed(mdl[0](imgs))
@@ -307,14 +315,17 @@ def encoder_level_epsilon_noise(model, loader, img_size, rounds, nlr, lim, eps, 
 
             #error_mult = (((preds - og_preds) ** 2).sum(dim=-1) ** 0.5).mean()
             error_mult = (((preds - og_preds) ** 2).sum(dim=-1)).mean()
-            error_mult.backward()
             running_err += error_mult.item()
-            if isinstance(model, DistributedDataParallel):
-                dist.barrier()
-                dist.all_reduce(delta_x.grad)
-                delta_x.grad /= dist.get_world_size()
-            optimizer.step()
-            scheduler.step()
+            if ns_mode == "random":
+                delta_x = delta_x * 0.8
+            else:
+                error_mult.backward()
+                if isinstance(model, DistributedDataParallel):
+                    dist.barrier()
+                    dist.all_reduce(delta_x.grad)
+                    delta_x.grad /= dist.get_world_size()
+                optimizer.step()
+                scheduler.step()
             if verbose and (st+1) % 10 == 0:
                 avg_err = running_err / 10 #1000
                 print(f"Noise error at step {st+1}: {round(avg_err, 4)}")

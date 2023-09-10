@@ -37,7 +37,7 @@ from timm.utils import ApexScaler, NativeScaler
 from timm.data import create_transform
 
 from utils import encoder_forward, encoder_level_epsilon_noise
-from ImageNetDG_10 import ImageNetDG_10
+from ImageNetDG_l import ImageNetDG_l
 from vqgan import VQModel, reconstruct_with_vqgan
 from easyrobust.attacks import pgd_generator
 import easyrobust.models
@@ -370,7 +370,7 @@ def main():
     eps = args.eps
     adv = not args.no_adv
     img_ratio = 0.1
-    train_ratio = 1.
+    train_ratio = 0.1
     val_ratio = 1.
 
     if args.debug:
@@ -570,8 +570,8 @@ def main():
 
     # create the train and eval datasets
     data_path = Path(args.data_dir)
-    dataset_train = ImageNetDG_10(data_path.joinpath('imagenet/train'), args.info_path, transform=train_transform)
-    dataset_eval = ImageNetDG_10(data_path.joinpath('imagenet/train'), args.info_path, transform=val_transform)
+    dataset_train = ImageNetDG_l(data_path.joinpath('imagenet/train'), args.info_path, transform=train_transform)
+    dataset_eval = ImageNetDG_l(data_path.joinpath('imagenet/train'), args.info_path, transform=val_transform)
 
     train_sampler = None
     eval_sampler = None
@@ -780,7 +780,7 @@ def train_one_epoch(
             adv_outputs = model.module[1].head(encoder_forward(model, x))
             adv_loss = loss_fn(adv_outputs, target)
             # adv_loss.backward()
-            consistency = ((adv_outputs - output) ** 2).sum(dim=-1).mean()
+            # consistency = ((adv_outputs - output) ** 2).sum(dim=-1).mean()
             loss = loss + adv_loss
 
         losses_m.update(loss.item(), input.size(0))
@@ -856,7 +856,7 @@ def validate(model, loader, loss_fn, args, val_ratio, amp_autocast=suppress, log
 
     model.eval()
     if adv:
-        attack = torchattacks.FGSM(model, eps=8 / 225)
+        attack = torchattacks.FGSM(model, eps=1 / 255)
     end = time.time()
     last_idx = len(loader) - 1
     with torch.no_grad():
